@@ -123,16 +123,16 @@ def display_results(results: List[Dict[str, Any]]):
         )
 
         # Aggregate loans by location
-        for loan in loans:
+        for single_loan in loans:
             # Create a unique location key (Library + Branch) to avoid merging same-named branches from diff libraries
-            location_key = f"{loan.library_name} - {loan.location_name}"
-            if loan.sub_location_name:
-                location_key += f" ({loan.sub_location_name})"
+            location_key = f"{single_loan.library_name} - {single_loan.location_name}"
+            if single_loan.sub_location_name:
+                location_key += f" ({single_loan.sub_location_name})"
 
             if location_key not in all_loans_by_location:
                 all_loans_by_location[location_key] = []
 
-            all_loans_by_location[location_key].append({"loan": loan, "owner": user_info.display_name})
+            all_loans_by_location[location_key].append({"loan": single_loan, "owner": user_info.display_name})
 
     console.print(summary_table)
     console.print()
