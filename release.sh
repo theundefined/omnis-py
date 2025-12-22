@@ -81,18 +81,27 @@ fi
 # I'll add the sed command back to update pyproject.toml
 sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
 
-# Create commit for version bump
+# Create commit for version bump only if there are changes
 git add pyproject.toml
-git commit -m "Bump version to v$NEW_VERSION"
+if ! git diff --cached --quiet; then
+    git commit -m "Bump version to v$NEW_VERSION"
+    echo "Committed version bump."
+else
+    echo "Version in pyproject.toml is already up to date. Skipping commit."
+fi
 
-# Create new tag
+# Create new tag if it doesn't exist
 NEW_TAG="v$NEW_VERSION"
-echo "Creating git tag: $NEW_TAG"
-git tag "$NEW_TAG" -m "$PROJECT_NAME Release $NEW_VERSION"
+if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+    echo "Tag $NEW_TAG already exists."
+else
+    echo "Creating git tag: $NEW_TAG"
+    git tag "$NEW_TAG" -m "$PROJECT_NAME Release $NEW_VERSION"
+fi
 
 # Push commit and tag
 echo "Pushing changes and tag to origin..."
-git push origin main
+git push origin main || echo "Main already up to date or push failed (skipping)"
 git push origin "$NEW_TAG"
 
 # Get repository owner and name
