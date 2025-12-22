@@ -34,9 +34,19 @@ class UserInfo(BaseModel):
 
 
 class OmnisClient:
-    def __init__(self, base_url: str = "https://omnis-br.primo.exlibrisgroup.com"):
+    def __init__(
+        self,
+        base_url: str = "https://omnis-br.primo.exlibrisgroup.com",
+        client: Optional[httpx.AsyncClient] = None,
+    ):
         self.base_url = base_url
-        self.client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+        if client:
+            self.client = client
+            self._close_client = False
+        else:
+            self.client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+            self._close_client = True
+
         self.token: Optional[str] = None
         self.user_data: Dict[str, Any] = {}
 
@@ -148,4 +158,5 @@ class OmnisClient:
         return response.json()
 
     async def close(self):
-        await self.client.aclose()
+        if self._close_client:
+            await self.client.aclose()
