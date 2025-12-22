@@ -37,7 +37,7 @@ git fetch origin --tags
 LAST_TAG=$(git describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" 2>/dev/null || echo "$DEFAULT_INITIAL_VERSION")
 
 # If no semantic version tags exist, start with the default initial version and assume 0.0.0 for first bump
-if [ "$LAST_TAG" = "$DEFAULT_INITIAL_VERSION" ] && [ "$(git tag --list \"$DEFAULT_INITIAL_VERSION\"")" = "" ]; then
+if [ "$LAST_TAG" = "$DEFAULT_INITIAL_VERSION" ] && [ "$(git tag --list "$DEFAULT_INITIAL_VERSION")" = "" ]; then
     echo "No semantic version tags found. Starting with $DEFAULT_INITIAL_VERSION."
     CURRENT_VERSION_SEMVER="0.0.0" # Base for first bump
 else
@@ -79,7 +79,7 @@ fi
 # The previous release.sh didn't have file update logic inside, it relied on the tag.
 # BUT, we should update pyproject.toml.
 # I'll add the sed command back to update pyproject.toml
-sed -i "s/^version = ".*"/version = \"$NEW_VERSION\"/" pyproject.toml
+sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
 
 # Create commit for version bump
 git add pyproject.toml
