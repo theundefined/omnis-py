@@ -144,6 +144,18 @@ class OmnisClient:
         loans_list = data.get("data", {}).get("loans", {}).get("loan", [])
         return [Loan.from_api(loan_data) for loan_data in loans_list]
 
+    async def get_personal_settings(self) -> Dict[str, Any]:
+        """Fetch full personal details (address, email, etc.)."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        url = f"{self.base_url}/primaws/rest/priv/myaccount/personal_settings"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        response = await self.client.get(url, params={"lang": "pl"}, headers=headers)
+        response.raise_for_status()
+        return response.json().get("data", {})
+
     async def renew_loan(self, loan_id: str) -> Dict[str, Any]:
         if not self.token:
             raise ValueError("Not logged in")
