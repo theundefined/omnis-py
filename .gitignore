@@ -34,3 +34,4 @@ build/
 .idea/
 .vscode/
 *.swp
+config_dump.json

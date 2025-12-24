@@ -24,6 +24,18 @@ class Loan(BaseModel):
         return cls(**data)
 
 
+class BookDetails(BaseModel):
+    mmsid: str
+    cover_url: Optional[str] = None
+    isbns: List[str] = []
+    publisher: Optional[str] = None
+    publication_date: Optional[str] = None
+    subjects: List[str] = []
+    genres: List[str] = []
+    physical_description: Optional[str] = None
+    original_title: Optional[str] = None
+
+
 class UserInfo(BaseModel):
     display_name: str
     user_name: str
@@ -49,10 +61,14 @@ class OmnisClient:
 
         self.token: Optional[str] = None
         self.user_data: Dict[str, Any] = {}
+        self.view: Optional[str] = None
+        self.institution: Optional[str] = None
 
     async def login(
         self, username: str, password: str, institution: str = "48OMNIS_BRP", view: str = "48OMNIS_BRP:BRACZ"
     ):
+        self.view = view
+        self.institution = institution
         # Initial request to get cookies
         await self.client.get(f"{self.base_url}/discovery/search", params={"vid": view})
 
@@ -143,6 +159,60 @@ class OmnisClient:
 
         loans_list = data.get("data", {}).get("loans", {}).get("loan", [])
         return [Loan.from_api(loan_data) for loan_data in loans_list]
+
+    async def get_cover_url(self, isbns: List[str]) -> Optional[str]:
+        """Try to find a cover image from OpenLibrary using ISBNs."""
+        base_url = "https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg"
+        for isbn in isbns:
+            url = base_url.format(isbn=isbn)
+            try:
+                # We use a HEAD request to be efficient and not download the whole image
+                response = await self.client.head(url, follow_redirects=True)
+                # OpenLibrary redirects to a placeholder if the image doesn't exist.
+                # A real cover will have a URL that contains the ISBN.
+                if response.status_code == 200 and isbn in str(response.url):
+                    return str(response.url)
+            except httpx.RequestError:
+                # Ignore connection errors and try the next ISBN
+                continue
+        return None
+
+    async def get_record_details(self, mmsid: str) -> "BookDetails":
+        """Fetch full record details (PNX) for a given MMS ID."""
+        if not self.view:
+            raise ValueError("View not set. Please login first.")
+
+        url = f"{self.base_url}/primaws/rest/pub/pnxs/L/alma{mmsid}"
+        params = {"vid": self.view, "lang": "pl"}
+        response = await self.client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        pnx = data.get("pnx", {})
+        display = pnx.get("display", {})
+        addata = pnx.get("addata", {})
+
+        isbns = addata.get("isbn", [])
+        cover_url = await self.get_cover_url(isbns)
+
+        original_title = None
+        if "addtitle" in display:
+            for title in display["addtitle"]:
+                if title.startswith("Tytuł oryginału:"):
+                    original_title = title.replace("Tytuł oryginału:", "").strip()
+                    break
+
+        return BookDetails(
+            mmsid=mmsid,
+            cover_url=cover_url,
+            isbns=isbns,
+            publisher=display.get("publisher", [None])[0],
+            publication_date=display.get("creationdate", [None])[0],
+            subjects=display.get("subject", []),
+            genres=display.get("genre", []),
+            physical_description=display.get("format", [None])[0],
+            original_title=original_title,
+        )
 
     async def get_personal_settings(self) -> Dict[str, Any]:
         """Fetch full personal details (address, email, etc.)."""

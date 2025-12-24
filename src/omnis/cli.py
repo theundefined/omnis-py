@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import yaml
 from rich.console import Console
@@ -11,7 +11,7 @@ from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from rich import print as rprint
 
-from omnis.client import OmnisClient, UserInfo, Loan
+from omnis.client import OmnisClient, UserInfo, Loan, BookDetails
 from omnis.tenants import KNOWN_TENANTS
 
 CONFIG_DIR = Path.home() / ".config" / "omnis-py"
@@ -75,20 +75,38 @@ def add_account_wizard() -> Dict[str, str]:
     }
 
 
-async def fetch_account_data(account: Dict[str, str]):
+async def fetch_account_data(account: Dict[str, str], details: bool = False) -> Dict[str, Any]:
     client = OmnisClient(account["base_url"])
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         user_info = await client.get_user_info()
         loans = await client.get_loans()
-        return {"account": account, "user_info": user_info, "loans": loans, "error": None}
+
+        loans_with_details: List[Dict[str, Any]] = []
+        if details:
+            # Fetch details for each loan concurrently
+            detail_tasks = [client.get_record_details(loan.mmsid) for loan in loans]
+            detailed_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+            for loan, detail_result in zip(loans, detailed_results):
+                if isinstance(detail_result, Exception):
+                    # Handle cases where detail fetching fails for a specific book
+                    console.print(f"[dim red]Could not fetch details for '{loan.title}': {detail_result}[/dim]")
+                    loans_with_details.append({"loan": loan, "details": None})
+                else:
+                    loans_with_details.append({"loan": loan, "details": detail_result})
+        else:
+            # If not fetching details, just wrap the loan object
+            loans_with_details = [{"loan": loan, "details": None} for loan in loans]
+
+        return {"account": account, "user_info": user_info, "loans": loans_with_details, "error": None}
     except Exception as e:
         return {"account": account, "error": str(e)}
     finally:
         await client.close()
 
 
-def display_results(results: List[Dict[str, Any]]):
+def display_results(results: List[Dict[str, Any]], details: bool = False):
     # 1. User Summary Table
     summary_table = Table(title="Users & Status")
     summary_table.add_column("User", style="cyan")
@@ -107,7 +125,7 @@ def display_results(results: List[Dict[str, Any]]):
             continue
 
         user_info: UserInfo = res["user_info"]
-        loans: List[Loan] = res["loans"]
+        loans: List[Dict[str, Any]] = res["loans"]
 
         fines_display = f"{user_info.fines_amount:.2f} {user_info.fines_currency}"
         if user_info.fines_amount > 0:
@@ -123,16 +141,19 @@ def display_results(results: List[Dict[str, Any]]):
         )
 
         # Aggregate loans by location
-        for single_loan in loans:
-            # Create a unique location key (Library + Branch) to avoid merging same-named branches from diff libraries
-            location_key = f"{single_loan.library_name} - {single_loan.location_name}"
-            if single_loan.sub_location_name:
-                location_key += f" ({single_loan.sub_location_name})"
+        for single_loan_item in loans:
+            loan: Loan = single_loan_item["loan"]
+            # Create a unique location key (Library + Branch)
+            location_key = f"{loan.library_name} - {loan.location_name}"
+            if loan.sub_location_name:
+                location_key += f" ({loan.sub_location_name})"
 
             if location_key not in all_loans_by_location:
                 all_loans_by_location[location_key] = []
 
-            all_loans_by_location[location_key].append({"loan": single_loan, "owner": user_info.display_name})
+            all_loans_by_location[location_key].append(
+                {"loan": loan, "details": single_loan_item["details"], "owner": user_info.display_name}
+            )
 
     console.print(summary_table)
     console.print()
@@ -149,15 +170,35 @@ def display_results(results: List[Dict[str, Any]]):
         loc_table.add_column("Title", style="white")
         loc_table.add_column("Borrowed By", style="cyan")
         loc_table.add_column("Status", style="dim")
+        if details:
+            loc_table.add_column("Details", style="dim")
 
         # Sort by due date
         items.sort(key=lambda x: x["loan"].due_date)
 
         for item in items:
-            loan: Loan = item["loan"]
+            current_loan: Loan = item["loan"]
+            book_details: Optional[BookDetails] = item["details"]
             owner = item["owner"]
 
-            loc_table.add_row(f"{loan.due_date}", loan.author or "", loan.title, owner, loan.status)
+            row_data = [
+                f"{current_loan.due_date}",
+                current_loan.author or "",
+                current_loan.title,
+                owner,
+                current_loan.status,
+            ]
+
+            if details:
+                if book_details:
+                    details_str = f"ISBN: {', '.join(book_details.isbns)}\n"
+                    details_str += f"Publisher: {book_details.publisher}\n"
+                    details_str += f"Cover: {book_details.cover_url}"
+                    row_data.append(details_str)
+                else:
+                    row_data.append("[dim]Not available[/dim]")
+
+            loc_table.add_row(*row_data)
 
         console.print(loc_table)
         console.print()
@@ -166,6 +207,7 @@ def display_results(results: List[Dict[str, Any]]):
 async def async_main():
     parser = argparse.ArgumentParser(description="OMNIS Library CLI Manager")
     parser.add_argument("--add", action="store_true", help="Add a new account to configuration")
+    parser.add_argument("--details", action="store_true", help="Fetch extended book details (slower)")
     args = parser.parse_args()
 
     accounts = load_config()
@@ -190,10 +232,10 @@ async def async_main():
         return
 
     with console.status("[bold green]Fetching library data...[/bold green]", spinner="dots"):
-        tasks = [fetch_account_data(acc) for acc in accounts]
+        tasks = [fetch_account_data(acc, args.details) for acc in accounts]
         results = await asyncio.gather(*tasks)
 
-    display_results(results)
+    display_results(results, args.details)
 
 
 def main():
