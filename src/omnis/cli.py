@@ -3,6 +3,8 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import json
+import csv
 
 import yaml
 from rich.console import Console
@@ -106,7 +108,7 @@ async def fetch_account_data(account: Dict[str, str], details: bool = False) -> 
         await client.close()
 
 
-def display_results(results: List[Dict[str, Any]], details: bool = False):
+def display_results_table(results: List[Dict[str, Any]], details: bool = False):
     # 1. User Summary Table
     summary_table = Table(title="Users & Status")
     summary_table.add_column("User", style="cyan")
@@ -204,10 +206,84 @@ def display_results(results: List[Dict[str, Any]], details: bool = False):
         console.print()
 
 
+class PydanticEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (Loan, BookDetails, UserInfo)):
+            return o.model_dump()
+        return super().default(o)
+
+
+def display_results_json(results: List[Dict[str, Any]]):
+    print(json.dumps(results, cls=PydanticEncoder, indent=2))
+
+
+def display_results_csv(results: List[Dict[str, Any]]):
+    writer = csv.writer(sys.stdout)
+    # Header
+    header = [
+        "account_username",
+        "user_name",
+        "display_name",
+        "loan_id",
+        "mmsid",
+        "title",
+        "author",
+        "due_date",
+        "due_hour",
+        "loan_date",
+        "loan_status",
+        "library_name",
+        "location_name",
+        "barcode",
+        "cover_url",
+        "isbns",
+        "publisher",
+        "publication_date",
+    ]
+    writer.writerow(header)
+
+    for res in results:
+        if res.get("error"):
+            continue
+        user_info: UserInfo = res["user_info"]
+        for item in res["loans"]:
+            loan: Loan = item["loan"]
+            details: Optional[BookDetails] = item["details"]
+            row = [
+                res["account"]["username"],
+                user_info.user_name,
+                user_info.display_name,
+                loan.id,
+                loan.mmsid,
+                loan.title,
+                loan.author,
+                loan.due_date,
+                loan.due_hour,
+                loan.loan_date,
+                loan.status,
+                loan.library_name,
+                loan.location_name,
+                loan.barcode,
+                details.cover_url if details else "",
+                ",".join(details.isbns) if details else "",
+                details.publisher if details else "",
+                details.publication_date if details else "",
+            ]
+            writer.writerow(row)
+
+
 async def async_main():
     parser = argparse.ArgumentParser(description="OMNIS Library CLI Manager")
     parser.add_argument("--add", action="store_true", help="Add a new account to configuration")
-    parser.add_argument("--details", action="store_true", help="Fetch extended book details (slower)")
+    parser.add_argument(
+        "--format",
+        choices=["table", "json", "csv"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument(
+        "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
+    )
     args = parser.parse_args()
 
     accounts = load_config()
@@ -231,11 +307,64 @@ async def async_main():
         rprint("[red]No accounts configured. Exiting.[/red]")
         return
 
+    # If requested, attempt to renew loans before fetching data so updated due dates are shown
+    if args.renew:
+        rprint("\n[bold green]Attempting to renew renewable loans for all accounts...[/bold green]")
+        for account in accounts:
+            client = OmnisClient(account["base_url"])
+            try:
+                await client.login(
+                    account["username"], account["password"], account.get("institution"), account.get("view")
+                )
+            except Exception as e:
+                console.print(f"[red]Login failed for {account.get('username')}: {e}[/red]")
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                continue
+
+            try:
+                loans = await client.get_loans()
+            except Exception as e:
+                console.print(f"[red]Could not fetch loans for {account.get('username')}: {e}[/red]")
+                await client.close()
+                continue
+
+            renewed_any = False
+            for loan in loans:
+                if getattr(loan, "renewable", False):
+                    try:
+                        res = await client.renew_loan(loan.id)
+                        console.print(
+                            f"[green]Renewed '{loan.title}' ({loan.id}) for {account.get('username')}: {res}[/green]"
+                        )
+                    except Exception as e:
+                        console.print(
+                            f"[red]Could not renew '{loan.title}' ({loan.id}) for {account.get('username')}: {e}[/red]"
+                        )
+                    renewed_any = True
+
+            if not renewed_any:
+                console.print(f"[dim]No renewable loans for {account.get('username')}[/dim]")
+
+            await client.close()
+
+        rprint("\n[bold green]Renewal attempts finished. Fetching updated data...[/bold green]")
+
+    # Details are needed for json and csv formats
+    fetch_details = args.format in ["json", "csv"]
+
     with console.status("[bold green]Fetching library data...[/bold green]", spinner="dots"):
-        tasks = [fetch_account_data(acc, args.details) for acc in accounts]
+        tasks = [fetch_account_data(acc, fetch_details) for acc in accounts]
         results = await asyncio.gather(*tasks)
 
-    display_results(results, args.details)
+    if args.format == "table":
+        display_results_table(results, details=fetch_details)
+    elif args.format == "json":
+        display_results_json(results)
+    elif args.format == "csv":
+        display_results_csv(results)
 
 
 def main():
