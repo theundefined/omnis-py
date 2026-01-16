@@ -47,6 +47,7 @@ Przy pierwszym uruchomieniu program poprowadzi Cię przez kreator dodawania kont
 
 - `omnis-cli` - wyświetla podsumowanie dla wszystkich kont i listę książek pogrupowaną według filii.
 - `omnis-cli --add` - dodaje nowe konto do konfiguracji.
+- `omnis-cli --renew` - próbuje przedłużyć wszystkie wypożyczenia oznaczone jako odnawialne dla skonfigurowanych kont przed pobraniem danych. Używaj ostrożnie; operacja wykona się bez dodatkowego potwierdzenia.
 
 ---
 
@@ -90,6 +91,7 @@ On first run, it will guide you through adding an account. Configuration is stor
 
 - `omnis-cli` - shows a summary for all accounts and a book list grouped by branch.
 - `omnis-cli --add` - adds a new account to the configuration.
+- `omnis-cli --renew` - attempts to renew all loans marked as renewable for configured accounts before fetching data. Use with caution; this action runs without an additional confirmation.
 
 ---
 
