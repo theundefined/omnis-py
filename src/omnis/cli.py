@@ -118,12 +118,12 @@ def add_account_wizard() -> Dict[str, str]:
     }
 
 
-async def fetch_account_data(account: Dict[str, str], details: bool = False) -> Dict[str, Any]:
+async def fetch_account_data(account: Dict[str, str], details: bool = False, history: bool = False) -> Dict[str, Any]:
     client = OmnisClient(account["base_url"])
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         user_info = await client.get_user_info()
-        loans = await client.get_loans()
+        loans = await client.get_loans(loan_type="history" if history else "active")
 
         loans_with_details: List[Dict[str, Any]] = []
         if details:
@@ -149,12 +149,12 @@ async def fetch_account_data(account: Dict[str, str], details: bool = False) -> 
         await client.close()
 
 
-def display_results_table(results: List[Dict[str, Any]], details: bool = False):
+def display_results_table(results: List[Dict[str, Any]], details: bool = False, history: bool = False):
     # 1. User Summary Table
     summary_table = Table(title="Users & Status")
     summary_table.add_column("User", style="cyan")
     summary_table.add_column("Library", style="magenta")
-    summary_table.add_column("Active Loans", justify="center", style="green")
+    summary_table.add_column("Loans" if history else "Active Loans", justify="center", style="green")
     summary_table.add_column("Fines", justify="right", style="red")
 
     all_loans_by_location: Dict[str, List[Dict[str, Any]]] = {}
@@ -179,7 +179,7 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False):
         summary_table.add_row(
             f"{user_info.display_name} ({res['account']['username']})",
             account.get("tenant_name", "Unknown"),
-            str(user_info.loans_count),
+            str(len(loans) if history else user_info.loans_count),
             fines_display,
         )
 
@@ -203,12 +203,12 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False):
 
     # 2. Books by Location Table
     if not all_loans_by_location:
-        console.print("[italic]No active loans found.[/italic]")
+        console.print(f"[italic]No {'historical' if history else 'active'} loans found.[/italic]")
         return
 
     for location, items in sorted(all_loans_by_location.items()):
         loc_table = Table(title=f"📍 {location}", show_header=True, header_style="bold")
-        loc_table.add_column("Return Date")
+        loc_table.add_column("Due Date" if history else "Return Date")
         loc_table.add_column("Author", style="blue")
         loc_table.add_column("Title", style="white")
         loc_table.add_column("Borrowed By", style="cyan")
@@ -224,8 +224,17 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False):
             book_details: Optional[BookDetails] = item["details"]
             owner = item["owner"]
 
+            date_display = current_loan.due_date
+            if not history:
+                date_display = format_due_date(current_loan.due_date)
+            else:
+                # For history, just show the date nicely formatted if possible, without relative coloring
+                d = parse_date(current_loan.due_date)
+                if d:
+                    date_display = d.strftime("%Y.%m.%d")
+
             row_data = [
-                format_due_date(current_loan.due_date),
+                date_display,
                 current_loan.author or "",
                 current_loan.title,
                 owner,
@@ -325,6 +334,7 @@ async def async_main():
     parser.add_argument(
         "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
     )
+    parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
     args = parser.parse_args()
 
     accounts = load_config()
@@ -349,7 +359,7 @@ async def async_main():
         return
 
     # If requested, attempt to renew loans before fetching data so updated due dates are shown
-    if args.renew:
+    if args.renew and not args.history:
         rprint("\n[bold green]Attempting to renew renewable loans for all accounts...[/bold green]")
         for account in accounts:
             client = OmnisClient(account["base_url"])
@@ -396,12 +406,14 @@ async def async_main():
     # Details are needed for json and csv formats
     fetch_details = args.format in ["json", "csv"]
 
-    with console.status("[bold green]Fetching library data...[/bold green]", spinner="dots"):
-        tasks = [fetch_account_data(acc, fetch_details) for acc in accounts]
+    with console.status(
+        f"[bold green]Fetching library {'history' if args.history else 'data'}...[/bold green]", spinner="dots"
+    ):
+        tasks = [fetch_account_data(acc, fetch_details, args.history) for acc in accounts]
         results = await asyncio.gather(*tasks)
 
     if args.format == "table":
-        display_results_table(results, details=fetch_details)
+        display_results_table(results, details=fetch_details, history=args.history)
     elif args.format == "json":
         display_results_json(results)
     elif args.format == "csv":
