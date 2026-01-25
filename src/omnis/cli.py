@@ -7,6 +7,7 @@ import json
 import csv
 
 import yaml
+from datetime import datetime, date
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Prompt, IntPrompt, Confirm
@@ -20,6 +21,46 @@ CONFIG_DIR = Path.home() / ".config" / "omnis-py"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 
 console = Console()
+
+
+def parse_date(date_str: str) -> Optional[date]:
+    """Try to parse date from common formats."""
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def format_due_date(date_str: str) -> str:
+    """Format due date with color and relative time (e.g. '2023-10-01 (za 2 dni)')."""
+    d = parse_date(date_str)
+    if not d:
+        return date_str
+
+    today = date.today()
+    delta = (d - today).days
+
+    # Determine relative text
+    if delta < 0:
+        relative = f"{abs(delta)} dni po terminie"
+    elif delta == 0:
+        relative = "dziś"
+    elif delta == 1:
+        relative = "jutro"
+    else:
+        relative = f"za {delta} dni"
+
+    full_text = f"{d.strftime('%Y.%m.%d')} ({relative})"
+
+    # Determine color
+    if delta <= 0:
+        return f"[bold red]{full_text}[/bold red]"
+    elif delta <= 7:
+        return f"[bold yellow]{full_text}[/bold yellow]"
+    else:
+        return f"[green]{full_text}[/green]"
 
 
 def load_config() -> List[Dict[str, str]]:
@@ -167,7 +208,7 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False):
 
     for location, items in sorted(all_loans_by_location.items()):
         loc_table = Table(title=f"📍 {location}", show_header=True, header_style="bold")
-        loc_table.add_column("Return Date", style="bold yellow", width=12)
+        loc_table.add_column("Return Date")
         loc_table.add_column("Author", style="blue")
         loc_table.add_column("Title", style="white")
         loc_table.add_column("Borrowed By", style="cyan")
@@ -184,7 +225,7 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False):
             owner = item["owner"]
 
             row_data = [
-                f"{current_loan.due_date}",
+                format_due_date(current_loan.due_date),
                 current_loan.author or "",
                 current_loan.title,
                 owner,
