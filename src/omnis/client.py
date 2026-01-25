@@ -140,25 +140,40 @@ class OmnisClient:
             fines_currency="PLN",  # Usually fixed or we could find it elsewhere
         )
 
-    async def get_loans(self) -> List[Loan]:
+    async def get_loans(self, loan_type: str = "active") -> List[Loan]:
         if not self.token:
             raise ValueError("Not logged in")
 
         loans_url = f"{self.base_url}/primaws/rest/priv/myaccount/loans"
-        params = {
-            "bulk": "50",
-            "lang": "pl",
-            "offset": "1",
-            "type": "active",
-        }
-        headers = {"Authorization": f"Bearer {self.token}"}
+        bulk_size = 50
+        offset = 1
+        all_loans = []
 
-        response = await self.client.get(loans_url, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        while True:
+            params = {
+                "bulk": str(bulk_size),
+                "lang": "pl",
+                "offset": str(offset),
+                "type": loan_type,
+            }
+            headers = {"Authorization": f"Bearer {self.token}"}
 
-        loans_list = data.get("data", {}).get("loans", {}).get("loan", [])
-        return [Loan.from_api(loan_data) for loan_data in loans_list]
+            response = await self.client.get(loans_url, params=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            loans_data = data.get("data", {}).get("loans", {})
+
+            current_batch = loans_data.get("loan", [])
+            all_loans.extend([Loan.from_api(loan_data) for loan_data in current_batch])
+
+            showmore = loans_data.get("showmore", [])
+            # showmore is typically a list like ['Y'] or empty/missing if no more
+            if not showmore or "Y" not in showmore:
+                break
+
+            offset += bulk_size
+
+        return all_loans
 
     async def get_cover_url(self, isbns: List[str]) -> Optional[str]:
         """Try to find a cover image from OpenLibrary using ISBNs."""
