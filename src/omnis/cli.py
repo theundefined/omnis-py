@@ -352,7 +352,9 @@ async def async_main():
     parser.add_argument(
         "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show more details like loan date and renewability")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Show more details like loan date and renewability"
+    )
     parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
     args = parser.parse_args()
 
