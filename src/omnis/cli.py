@@ -149,7 +149,9 @@ async def fetch_account_data(account: Dict[str, str], details: bool = False, his
         await client.close()
 
 
-def display_results_table(results: List[Dict[str, Any]], details: bool = False, history: bool = False):
+def display_results_table(
+    results: List[Dict[str, Any]], details: bool = False, history: bool = False, verbose: bool = False
+):
     # 1. User Summary Table
     summary_table = Table(title="Users & Status")
     summary_table.add_column("User", style="cyan")
@@ -209,10 +211,14 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False, 
     for location, items in sorted(all_loans_by_location.items()):
         loc_table = Table(title=f"📍 {location}", show_header=True, header_style="bold")
         loc_table.add_column("Due Date" if history else "Return Date")
+        if verbose:
+            loc_table.add_column("Loan Date", style="dim")
         loc_table.add_column("Author", style="blue")
         loc_table.add_column("Title", style="white")
         loc_table.add_column("Borrowed By", style="cyan")
         loc_table.add_column("Status", style="dim")
+        if verbose:
+            loc_table.add_column("Renew", justify="center")
         if details:
             loc_table.add_column("Details", style="dim")
 
@@ -235,11 +241,23 @@ def display_results_table(results: List[Dict[str, Any]], details: bool = False, 
 
             row_data = [
                 date_display,
-                current_loan.author or "",
-                current_loan.title,
-                owner,
-                current_loan.status,
             ]
+
+            if verbose:
+                ld = parse_date(current_loan.loan_date)
+                row_data.append(ld.strftime("%Y.%m.%d") if ld else current_loan.loan_date)
+
+            row_data.extend(
+                [
+                    current_loan.author or "",
+                    current_loan.title,
+                    owner,
+                    current_loan.status,
+                ]
+            )
+
+            if verbose:
+                row_data.append("[green]✓[/green]" if current_loan.renewable else "[red]✗[/red]")
 
             if details:
                 if book_details:
@@ -334,6 +352,7 @@ async def async_main():
     parser.add_argument(
         "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
     )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show more details like loan date and renewability")
     parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
     args = parser.parse_args()
 
@@ -413,7 +432,7 @@ async def async_main():
         results = await asyncio.gather(*tasks)
 
     if args.format == "table":
-        display_results_table(results, details=fetch_details, history=args.history)
+        display_results_table(results, details=fetch_details, history=args.history, verbose=args.verbose)
     elif args.format == "json":
         display_results_json(results)
     elif args.format == "csv":
