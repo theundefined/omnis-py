@@ -1,5 +1,7 @@
+import asyncio
+import re
 import httpx
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -43,6 +45,34 @@ class UserInfo(BaseModel):
     requests_count: int = 0
     fines_amount: float = 0.0
     fines_currency: str = "PLN"
+
+
+class BranchAvailability(BaseModel):
+    library_name: str
+    library_code: str
+    sub_location: Optional[str] = None
+    status: str
+    due_date: Optional[str] = None
+    overdue: bool = False
+
+
+class BookVersion(BaseModel):
+    mmsid: str
+    title: str
+    author: Optional[str] = None
+    edition: Optional[str] = None
+    publisher: Optional[str] = None
+    publication_date: Optional[str] = None
+    isbns: List[str] = []
+    frbrgroupid: Optional[str] = None
+    branches: List[BranchAvailability] = []
+
+
+class SearchResult(BaseModel):
+    frbrgroupid: Optional[str] = None
+    title: str
+    author: Optional[str] = None
+    versions: List[BookVersion] = []
 
 
 class OmnisClient:
@@ -253,6 +283,282 @@ class OmnisClient:
         response = await self.client.post(renew_url, params=params, headers=headers, json=data)
         response.raise_for_status()
         return response.json()
+
+    def _build_search_params(
+        self, q: str, qInclude: str = "", sort: str = "rank", limit: int = 10, came_from: Optional[str] = None
+    ) -> Dict[str, str]:
+        params = {
+            "acTriggered": "false",
+            "blendFacetsSeparately": "false",
+            "citationTrailFilterByAvailability": "true",
+            "disableCache": "false",
+            "getMore": "0",
+            "inst": self.institution or "",
+            "isCDSearch": "false",
+            "lang": "pl",
+            "limit": str(limit),
+            "newspapersActive": "false",
+            "newspapersSearch": "false",
+            "offset": "0",
+            "otbRanking": "false",
+            "pcAvailability": "true",
+            "q": f"any,contains,{q}",
+            "qExclude": "",
+            "qInclude": qInclude,
+            "rapido": "false",
+            "refEntryActive": "false",
+            "rtaLinks": "true",
+            "scope": "MyInstitution2",
+            "searchInFulltextUserSelection": "true",
+            "skipDelivery": "Y",
+            "sort": sort,
+            "tab": "LibraryCatalog",
+            "vid": self.view or "",
+        }
+        if came_from:
+            params["came_from"] = came_from
+        return params
+
+    async def _pnxs_search(self, params: Dict[str, str]) -> Dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        response = await self.client.get(f"{self.base_url}/primaws/rest/pub/pnxs", params=params, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def _pnxs_delivery(self, params: Dict[str, str], alma_ids: List[str]) -> List[Dict[str, Any]]:
+        if not alma_ids:
+            return []
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        response = await self.client.post(
+            f"{self.base_url}/primaws/rest/pub/delivery", params=params, headers=headers, json=alma_ids
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _display_first(doc: Dict[str, Any], field: str) -> Optional[str]:
+        values = doc.get("pnx", {}).get("display", {}).get(field)
+        return values[0] if values else None
+
+    @staticmethod
+    def _addata_first(doc: Dict[str, Any], field: str) -> Optional[str]:
+        values = doc.get("pnx", {}).get("addata", {}).get(field)
+        return values[0] if values else None
+
+    @staticmethod
+    def _extract_frbrgroupid(doc: Dict[str, Any]) -> Optional[str]:
+        values = doc.get("pnx", {}).get("facets", {}).get("frbrgroupid")
+        return values[0] if values else None
+
+    @staticmethod
+    def _alma_id(doc: Dict[str, Any]) -> Optional[str]:
+        values = doc.get("pnx", {}).get("control", {}).get("recordid")
+        return values[0] if values else None
+
+    @staticmethod
+    def _bare_mmsid(doc: Dict[str, Any]) -> str:
+        values = doc.get("pnx", {}).get("control", {}).get("sourcerecordid")
+        if values:
+            return values[0]
+        alma_id = OmnisClient._alma_id(doc)
+        if alma_id and alma_id.startswith("alma"):
+            return alma_id[4:]
+        return alma_id or ""
+
+    async def _get_physical_service_id(self, bare_mmsid: str) -> Optional[str]:
+        params = {
+            "vid": self.view or "",
+            "lang": "pl",
+            "recordOwner": "48OMNIS_NETWORK",
+            "sourceRecordId": bare_mmsid,
+            "resource_type": "book",
+            "isRapido": "false",
+        }
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        try:
+            response = await self.client.get(
+                f"{self.base_url}/primaws/rest/pub/getPhysicalService/{bare_mmsid}", params=params, headers=headers
+            )
+            response.raise_for_status()
+            return response.json().get("physicalServiceId")
+        except httpx.HTTPError:
+            return None
+
+    async def _get_due_date_for_holding(
+        self, bare_mmsid: str, holding: Dict[str, Any], physical_service_id: str
+    ) -> Optional[Tuple[Optional[str], bool]]:
+        """Fetch item-level status for a single branch holding to extract its due date, if any."""
+        main_location = holding.get("mainLocation", "")
+        body = {
+            "filters": {
+                "noItem": 10,
+                "sublibrary": main_location,
+                "collection": "",
+                "callnumber": "",
+                "holid": holding.get("holdId", ""),
+                "sublibs": main_location,
+                "ilsRecordList": [{"institution": self.institution, "recordId": bare_mmsid}],
+                "vid": self.view,
+                "filterCall": True,
+            },
+            "locations": [holding],
+            "hideResourceSharing": False,
+        }
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/primaws/rest/priv/ILSServices/holdings/{physical_service_id}",
+                params={"record-institution": self.institution, "lang": "pl"},
+                headers=headers,
+                json=body,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError:
+            return None
+
+        for loc in data.get("data", {}).get("itemInfo", {}).get("locations", []):
+            for item in loc.get("items", []):
+                status_name = item.get("itemstatusname", "")
+                match = re.search(r"(\d{2}/\d{2}/\d{4})", status_name)
+                if match:
+                    overdue = "przekroczon" in status_name.lower()
+                    return match.group(1), overdue
+        return None, False
+
+    async def search_books(
+        self, query: str, limit: int = 10, branch_filter: Optional[str] = None, fetch_due_dates: bool = True
+    ) -> List[SearchResult]:
+        """Search the catalog by title/keyword.
+
+        A single title (frbrgroupid) can have multiple editions/versions; all are fetched and
+        kept distinguished under one SearchResult. Availability is resolved per branch, and for
+        branches that are currently unavailable, the due date is fetched separately since Primo
+        only exposes it at the individual-item level.
+        """
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        top_params = self._build_search_params(query, limit=limit)
+        top_data = await self._pnxs_search(top_params)
+        top_docs = top_data.get("docs", [])
+
+        async def resolve_versions_with_delivery(
+            doc: Dict[str, Any],
+        ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+            # The delivery endpoint re-runs its own search internally using the given query
+            # params (q/qInclude/sort) and only reports on ids that fall within that same
+            # result page, so it must be called once per distinct query variant (i.e. once
+            # per version-group), using that group's own params and doc ids.
+            frbrgroupid = self._extract_frbrgroupid(doc)
+            if frbrgroupid:
+                # A work's edition count is independent of how many distinct works the
+                # top-level search returned, so use a generously high fixed limit here
+                # rather than the (often much smaller) top-level `limit`.
+                group_params = self._build_search_params(
+                    query,
+                    qInclude=f"facet_frbrgroupid,exact,{frbrgroupid}",
+                    sort="date_d",
+                    limit=50,
+                    came_from="addFacet",
+                )
+                group_data = await self._pnxs_search(group_params)
+                version_docs = group_data.get("docs", []) or [doc]
+                delivery_query_params = group_params
+            else:
+                version_docs = [doc]
+                delivery_query_params = top_params
+
+            alma_ids = list(dict.fromkeys(i for i in (self._alma_id(d) for d in version_docs) if i))
+            delivery_by_id: Dict[str, Dict[str, Any]] = {}
+            if alma_ids:
+                delivery_items = await self._pnxs_delivery(delivery_query_params, alma_ids)
+                for item in delivery_items:
+                    rid = self._alma_id(item)
+                    if rid:
+                        delivery_by_id[rid] = item
+
+            return version_docs, delivery_by_id
+
+        resolved = await asyncio.gather(*(resolve_versions_with_delivery(doc) for doc in top_docs))
+        versions_per_work = [r[0] for r in resolved]
+        delivery_maps_per_work = [r[1] for r in resolved]
+
+        branch_filter_lower = branch_filter.lower() if branch_filter else None
+        enrich_targets: List[Tuple[BranchAvailability, str, Dict[str, Any]]] = []
+        results: List[SearchResult] = []
+
+        for doc, versions, delivery_by_id in zip(top_docs, versions_per_work, delivery_maps_per_work):
+            frbrgroupid = self._extract_frbrgroupid(doc)
+            title = self._addata_first(doc, "btitle") or self._display_first(doc, "title") or "Unknown"
+            author = self._addata_first(doc, "au")
+
+            book_versions: List[BookVersion] = []
+            for v in versions:
+                alma_id = self._alma_id(v)
+                delivery_item = delivery_by_id.get(alma_id, {}) if alma_id else {}
+                holdings = (delivery_item.get("delivery") or {}).get("holding") or []
+
+                branches: List[BranchAvailability] = []
+                for h in holdings:
+                    main_location = h.get("mainLocation", "")
+                    if branch_filter_lower and branch_filter_lower not in main_location.lower():
+                        continue
+                    branch = BranchAvailability(
+                        library_name=main_location,
+                        library_code=h.get("libraryCode", ""),
+                        sub_location=h.get("subLocation"),
+                        status=h.get("availabilityStatus", "unknown"),
+                    )
+                    branches.append(branch)
+                    if fetch_due_dates and branch.status == "unavailable":
+                        bare_mmsid = self._bare_mmsid(v)
+                        enrich_targets.append((branch, bare_mmsid, h))
+
+                if branch_filter_lower and not branches:
+                    continue
+
+                book_versions.append(
+                    BookVersion(
+                        mmsid=self._bare_mmsid(v),
+                        title=self._display_first(v, "title") or title,
+                        author=self._addata_first(v, "au") or author,
+                        edition=self._display_first(v, "edition"),
+                        publisher=self._addata_first(v, "pub"),
+                        publication_date=self._addata_first(v, "date"),
+                        isbns=v.get("pnx", {}).get("addata", {}).get("isbn", []),
+                        frbrgroupid=frbrgroupid,
+                        branches=branches,
+                    )
+                )
+
+            if branch_filter_lower and not book_versions:
+                continue
+
+            results.append(SearchResult(frbrgroupid=frbrgroupid, title=title, author=author, versions=book_versions))
+
+        if enrich_targets:
+            unique_mmsids = list(dict.fromkeys(m for _, m, _ in enrich_targets))
+            service_ids = await asyncio.gather(*(self._get_physical_service_id(m) for m in unique_mmsids))
+            service_id_map = dict(zip(unique_mmsids, service_ids))
+
+            async def enrich(branch: BranchAvailability, bare_mmsid: str, holding: Dict[str, Any]) -> None:
+                service_id = service_id_map.get(bare_mmsid)
+                if not service_id:
+                    return
+                result = await self._get_due_date_for_holding(bare_mmsid, holding, service_id)
+                if result:
+                    due_date, overdue = result
+                    branch.due_date = due_date
+                    branch.overdue = overdue
+
+            await asyncio.gather(*(enrich(b, m, h) for b, m, h in enrich_targets))
+
+        return results
 
     async def close(self):
         if self._close_client:

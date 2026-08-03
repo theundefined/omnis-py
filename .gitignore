@@ -35,3 +35,6 @@ build/
 .vscode/
 *.swp
 config_dump.json
+
+# tmp
+curls

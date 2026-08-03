@@ -3,6 +3,23 @@ import respx
 from omnis.client import OmnisClient
 
 
+def _doc(recordid, sourcerecordid, title, btitle, au, edition, date, pub, isbn, frbrgroupid):
+    return {
+        "pnx": {
+            "display": {"title": [title], "edition": [edition] if edition else []},
+            "addata": {
+                "btitle": [btitle],
+                "au": [au],
+                "pub": [pub],
+                "date": [date],
+                "isbn": [isbn] if isbn else [],
+            },
+            "control": {"recordid": [recordid], "sourcerecordid": [sourcerecordid]},
+            "facets": {"frbrgroupid": [frbrgroupid]} if frbrgroupid else {},
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_login_success():
     client = OmnisClient()
@@ -57,3 +74,160 @@ async def test_get_loans_success():
         assert len(loans) == 1
         assert loans[0].title == "Test Book"
         assert loans[0].renewable is True
+
+
+@pytest.mark.asyncio
+async def test_search_books_groups_versions_and_resolves_due_dates():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    client.view = "48OMNIS_BRP:BRACZ"
+    client.institution = "48OMNIS_BRP"
+
+    top_doc = _doc(
+        "almaTOP1",
+        "TOP1",
+        "Płomień i krzyż / Jacek Piekara.",
+        "Płomień i krzyż",
+        "Piekara, Jacek",
+        "Wydanie III.",
+        "2012",
+        "Fabryka Słów",
+        "9788375747775",
+        "GROUP1",
+    )
+    version_old = _doc(
+        "almaOLD1",
+        "OLD1",
+        "Płomień i krzyż / Jacek Piekara.",
+        "Płomień i krzyż",
+        "Piekara, Jacek",
+        "Wydanie I.",
+        "2008",
+        "Fabryka Słów",
+        "9788375740011",
+        "GROUP1",
+    )
+    version_new = _doc(
+        "almaTOP1",
+        "TOP1",
+        "Płomień i krzyż / Jacek Piekara.",
+        "Płomień i krzyż",
+        "Piekara, Jacek",
+        "Wydanie III.",
+        "2012",
+        "Fabryka Słów",
+        "9788375747775",
+        "GROUP1",
+    )
+
+    def holding(main_location, library_code, hold_id, status):
+        return {
+            "mainLocation": main_location,
+            "libraryCode": library_code,
+            "subLocation": "Some address",
+            "availabilityStatus": status,
+            "holdId": hold_id,
+        }
+
+    delivery_response = [
+        {"pnx": version_new["pnx"], "delivery": {"holding": [holding("Filia 01", "F01", "H1", "available")]}},
+        {
+            "pnx": version_old["pnx"],
+            "delivery": {"holding": [holding("BG - Wypożyczalnia", "WYPOZ", "H2", "unavailable")]},
+        },
+    ]
+
+    with respx.mock:
+        respx.get(
+            "https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/pnxs",
+            params={"qInclude": ""},
+        ).respond(200, json={"docs": [top_doc]})
+        respx.get(
+            "https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/pnxs",
+            params={"qInclude": "facet_frbrgroupid,exact,GROUP1"},
+        ).respond(200, json={"docs": [version_new, version_old]})
+        delivery_route = respx.post("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/delivery").respond(
+            200, json=delivery_response
+        )
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/getPhysicalService/OLD1").respond(
+            200, json={"physicalServiceId": "PS123"}
+        )
+        respx.post("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/ILSServices/holdings/PS123").respond(
+            200,
+            json={
+                "data": {
+                    "itemInfo": {
+                        "locations": [
+                            {"items": [{"itemstatusname": "Wypożyczony - termin zwrotu przekroczony od 20/03/2026"}]}
+                        ]
+                    }
+                }
+            },
+        )
+
+        results = await client.search_books("płomień i krzyż")
+
+    # The delivery endpoint re-runs its own search using the given q/qInclude/sort and only
+    # reports on ids within that result page, so it must be called once per version-group
+    # with that group's own params — never once with every id batched under top-level params.
+    assert delivery_route.call_count == 1
+    assert delivery_route.calls[0].request.url.params["qInclude"] == "facet_frbrgroupid,exact,GROUP1"
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.title == "Płomień i krzyż"
+    assert len(result.versions) == 2
+
+    by_mmsid = {v.mmsid: v for v in result.versions}
+    assert by_mmsid["TOP1"].edition == "Wydanie III."
+    assert by_mmsid["TOP1"].branches[0].status == "available"
+    assert by_mmsid["TOP1"].branches[0].due_date is None
+
+    assert by_mmsid["OLD1"].edition == "Wydanie I."
+    unavailable_branch = by_mmsid["OLD1"].branches[0]
+    assert unavailable_branch.status == "unavailable"
+    assert unavailable_branch.due_date == "20/03/2026"
+    assert unavailable_branch.overdue is True
+
+
+@pytest.mark.asyncio
+async def test_search_books_branch_filter_drops_non_matching_versions():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    client.view = "48OMNIS_BRP:BRACZ"
+    client.institution = "48OMNIS_BRP"
+
+    top_doc = _doc("almaX1", "X1", "Some Book.", "Some Book", "An Author", None, "2020", "Pub", "111", None)
+
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/pnxs").respond(
+            200, json={"docs": [top_doc]}
+        )
+        respx.post("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/delivery").respond(
+            200,
+            json=[
+                {
+                    "pnx": top_doc["pnx"],
+                    "delivery": {
+                        "holding": [
+                            {"mainLocation": "Filia 01", "libraryCode": "F01", "availabilityStatus": "available"},
+                            {"mainLocation": "Filia 02", "libraryCode": "F02", "availabilityStatus": "available"},
+                        ]
+                    },
+                }
+            ],
+        )
+
+        results = await client.search_books("some book", branch_filter="Filia 02", fetch_due_dates=False)
+
+    assert len(results) == 1
+    assert len(results[0].versions) == 1
+    assert len(results[0].versions[0].branches) == 1
+    assert results[0].versions[0].branches[0].library_name == "Filia 02"
+
+
+@pytest.mark.asyncio
+async def test_search_books_requires_login():
+    client = OmnisClient()
+    with pytest.raises(ValueError):
+        await client.search_books("anything")

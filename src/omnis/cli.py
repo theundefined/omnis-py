@@ -14,8 +14,11 @@ from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from rich import print as rprint
 
-from omnis.client import OmnisClient, UserInfo, Loan, BookDetails
+import httpx
+
+from omnis.client import OmnisClient, UserInfo, Loan, BookDetails, SearchResult
 from omnis.tenants import KNOWN_TENANTS
+from omnis.branches import fetch_branches, BranchInfo
 
 CONFIG_DIR = Path.home() / ".config" / "omnis-py"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
@@ -274,6 +277,94 @@ def display_results_table(
         console.print()
 
 
+async def run_search(account: Dict[str, str], query: str, branch_filter: Optional[str] = None):
+    client = OmnisClient(account["base_url"])
+    try:
+        await client.login(account["username"], account["password"], account["institution"], account["view"])
+        with console.status(f"[bold green]Searching for '{query}'...[/bold green]", spinner="dots"):
+            results = await client.search_books(query, branch_filter=branch_filter)
+        display_search_results(results, query, branch_filter)
+    except Exception as e:
+        console.print(f"[bold red]Search error:[/bold red] {e}")
+    finally:
+        await client.close()
+
+
+def display_search_results(results: List[SearchResult], query: str, branch_filter: Optional[str] = None):
+    if not results:
+        suffix = f" (branch: {branch_filter})" if branch_filter else ""
+        console.print(f"[italic]No results for '{query}'{suffix}.[/italic]")
+        return
+
+    for result in results:
+        title_line = f"📖 {result.title}"
+        if result.author:
+            title_line += f" — {result.author}"
+
+        table = Table(title=title_line, show_header=True, header_style="bold")
+        table.add_column("Edition", style="dim")
+        table.add_column("Year", justify="center")
+        table.add_column("Branch", style="magenta")
+        table.add_column("Status")
+
+        for version in result.versions:
+            edition_label = version.edition or "-"
+            year = version.publication_date or "-"
+
+            if not version.branches:
+                table.add_row(edition_label, year, "[dim]no data[/dim]", "")
+                continue
+
+            for branch in version.branches:
+                if branch.status == "available":
+                    status_display = "[green]Available[/green]"
+                elif branch.due_date:
+                    if branch.overdue:
+                        status_display = f"[red]Overdue since {branch.due_date}[/red]"
+                    else:
+                        status_display = f"[yellow]Borrowed until {branch.due_date}[/yellow]"
+                else:
+                    status_display = "[yellow]Borrowed[/yellow]"
+                table.add_row(edition_label, year, branch.library_name, status_display)
+
+        console.print(table)
+        console.print()
+
+
+async def run_branches(branch_filter: Optional[str] = None):
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        try:
+            with console.status("[bold green]Fetching branch directory...[/bold green]", spinner="dots"):
+                branches = await fetch_branches(client)
+        except Exception as e:
+            console.print(f"[bold red]Could not fetch branch directory:[/bold red] {e}")
+            return
+
+    if branch_filter:
+        needle = branch_filter.lower()
+        branches = [b for b in branches if needle in b.name.lower()]
+
+    display_branches(branches, branch_filter)
+
+
+def display_branches(branches: List[BranchInfo], branch_filter: Optional[str] = None):
+    if not branches:
+        suffix = f" matching '{branch_filter}'" if branch_filter else ""
+        console.print(f"[italic]No branches found{suffix}.[/italic]")
+        return
+
+    # A table would squeeze the long Maps URL against short columns; a panel per
+    # branch instead gives every field (especially the URL) its own full-width line.
+    for branch in branches:
+        lines = [f"[bold]Address:[/bold] {branch.address or '-'}"]
+        lines.append(f"[bold]Hours:[/bold]   {branch.hours or '-'}")
+        if branch.phone:
+            lines.append(f"[bold]Phone:[/bold]   {branch.phone}")
+        if branch.maps_url:
+            lines.append(f"[bold]Maps:[/bold]    [blue]{branch.maps_url}[/blue]")
+        console.print(Panel("\n".join(lines), title=f"📍 {branch.name}", title_align="left"))
+
+
 class PydanticEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, (Loan, BookDetails, UserInfo)):
@@ -356,9 +447,29 @@ async def async_main():
         "-v", "--verbose", action="store_true", help="Show more details like loan date and renewability"
     )
     parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
+    parser.add_argument("--search", metavar="QUERY", help="Search the catalog by title/keyword")
+    parser.add_argument(
+        "--branch", metavar="NAME", help="Filter --search/--branches results to names containing this text"
+    )
+    parser.add_argument(
+        "--branches",
+        action="store_true",
+        help="Show the Biblioteka Raczyńskich branch directory (address, hours, phone, maps link)",
+    )
     args = parser.parse_args()
 
+    if args.branches:
+        await run_branches(args.branch)
+        return
+
     accounts = load_config()
+
+    if args.search:
+        if not accounts:
+            rprint("[red]No accounts configured. Add one first with --add.[/red]")
+            return
+        await run_search(accounts[0], args.search, args.branch)
+        return
 
     if args.add or not accounts:
         if not accounts:

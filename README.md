@@ -48,6 +48,12 @@ Przy pierwszym uruchomieniu program poprowadzi Cię przez kreator dodawania kont
 - `omnis-cli` - wyświetla podsumowanie dla wszystkich kont i listę książek pogrupowaną według filii.
 - `omnis-cli --add` - dodaje nowe konto do konfiguracji.
 - `omnis-cli --renew` - próbuje przedłużyć wszystkie wypożyczenia oznaczone jako odnawialne dla skonfigurowanych kont przed pobraniem danych. Używaj ostrożnie; operacja wykona się bez dodatkowego potwierdzenia.
+- `omnis-cli --search "tytuł lub fragment"` - wyszukuje książki w katalogu (na koncie pierwszej skonfigurowanej biblioteki), grupując wyniki wg tytułu i pokazując wszystkie wydania/wersje osobno wraz ze statusem dostępności w poszczególnych filiach (dostępna / wypożyczona do dnia).
+- `omnis-cli --search "..." --branch "nazwa filii"` - jak wyżej, ale ogranicza wyniki do filii, których nazwa zawiera podany fragment (bez rozróżniania wielkości liter).
+- `omnis-cli --branches` - pokazuje katalog filii Biblioteki Raczyńskich (adres, godziny otwarcia, telefon, link do Google Maps). Nie wymaga skonfigurowanego konta - dane pochodzą bezpośrednio ze strony bracz.edu.pl. Działa wyłącznie dla Biblioteki Raczyńskich.
+- `omnis-cli --branches --branch "Filia 35"` - jak wyżej, ograniczone do filii, których nazwa zawiera podany fragment.
+
+Przykład wyszukiwania krok po kroku (cały cykl książek, z priorytetem konkretnych filii): [docs/examples/plomien-i-krzyz.md](docs/examples/plomien-i-krzyz.md).
 
 ---
 
@@ -92,6 +98,10 @@ On first run, it will guide you through adding an account. Configuration is stor
 - `omnis-cli` - shows a summary for all accounts and a book list grouped by branch.
 - `omnis-cli --add` - adds a new account to the configuration.
 - `omnis-cli --renew` - attempts to renew all loans marked as renewable for configured accounts before fetching data. Use with caution; this action runs without an additional confirmation.
+- `omnis-cli --search "title or keyword"` - searches the catalog (using the first configured account), grouping results by title and showing every edition/version separately along with per-branch availability (available / borrowed until date).
+- `omnis-cli --search "..." --branch "branch name"` - as above, but limited to branches whose name contains the given text (case-insensitive).
+- `omnis-cli --branches` - shows the Biblioteka Raczyńskich branch directory (address, opening hours, phone, Google Maps link). No account required - data comes directly from bracz.edu.pl. Works for Biblioteka Raczyńskich only.
+- `omnis-cli --branches --branch "Filia 35"` - as above, limited to branches whose name contains the given text.
 
 ---
 
