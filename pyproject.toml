@@ -41,7 +41,16 @@ packages = ["src/omnis"]
 
 [tool.black]
 line-length = 120
+target-version = ["py311"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+
+[tool.ruff.lint]
+# Pin the rule set explicitly: newer ruff releases default to a much larger
+# rule selection when [tool.ruff.lint].select is unset, which would otherwise
+# silently start failing CI on every unrelated ruff upgrade. This matches the
+# classic default (pyflakes + a handful of pycodestyle error checks) the
+# project has always effectively relied on.
+select = ["E4", "E7", "E9", "F"]
