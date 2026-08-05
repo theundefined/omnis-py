@@ -3,16 +3,38 @@ import respx
 from omnis.client import OmnisClient
 
 
-def _doc(recordid, sourcerecordid, title, btitle, au, edition, date, pub, isbn, frbrgroupid):
+def _doc(
+    recordid,
+    sourcerecordid,
+    title,
+    btitle,
+    au,
+    edition,
+    date,
+    pub,
+    isbn,
+    frbrgroupid,
+    seriestitle=None,
+    genre=None,
+    subject=None,
+    language=None,
+):
     return {
         "pnx": {
-            "display": {"title": [title], "edition": [edition] if edition else []},
+            "display": {
+                "title": [title],
+                "edition": [edition] if edition else [],
+                "genre": genre or [],
+                "subject": subject or [],
+                "language": [language] if language else [],
+            },
             "addata": {
                 "btitle": [btitle],
                 "au": [au],
                 "pub": [pub],
                 "date": [date],
                 "isbn": [isbn] if isbn else [],
+                "seriestitle": [seriestitle] if seriestitle else [],
             },
             "control": {"recordid": [recordid], "sourcerecordid": [sourcerecordid]},
             "facets": {"frbrgroupid": [frbrgroupid]} if frbrgroupid else {},
@@ -125,6 +147,7 @@ async def test_search_books_groups_versions_and_resolves_due_dates():
             "mainLocation": main_location,
             "libraryCode": library_code,
             "subLocation": "Some address",
+            "stackMapUrl": "https://maps.app.goo.gl/fake",
             "availabilityStatus": status,
             "holdId": hold_id,
         }
@@ -182,6 +205,8 @@ async def test_search_books_groups_versions_and_resolves_due_dates():
     assert by_mmsid["TOP1"].edition == "Wydanie III."
     assert by_mmsid["TOP1"].branches[0].status == "available"
     assert by_mmsid["TOP1"].branches[0].due_date is None
+    assert by_mmsid["TOP1"].branches[0].sub_location == "Some address"
+    assert by_mmsid["TOP1"].branches[0].maps_url == "https://maps.app.goo.gl/fake"
 
     assert by_mmsid["OLD1"].edition == "Wydanie I."
     unavailable_branch = by_mmsid["OLD1"].branches[0]
@@ -224,6 +249,46 @@ async def test_search_books_branch_filter_drops_non_matching_versions():
     assert len(results[0].versions) == 1
     assert len(results[0].versions[0].branches) == 1
     assert results[0].versions[0].branches[0].library_name == "Filia 02"
+
+
+@pytest.mark.asyncio
+async def test_search_books_captures_series_and_subject_metadata():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    client.view = "48OMNIS_BRP:BRACZ"
+    client.institution = "48OMNIS_BRP"
+
+    top_doc = _doc(
+        "almaY1",
+        "Y1",
+        "Kościany Galeon / Jacek Piekara.",
+        "Kościany Galeon",
+        "Piekara, Jacek",
+        None,
+        "2015",
+        "Fabryka Słów",
+        "9788379640157",
+        None,
+        seriestitle="Ja, inkwizytor / Jacek Piekara",
+        genre=["Fantastyka", "Powieść"],
+        subject=["Mordimer Madderdin (postać fikcyjna)", "Inkwizycja"],
+        language="pol",
+    )
+
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/pnxs").respond(
+            200, json={"docs": [top_doc]}
+        )
+        respx.post("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/pub/delivery").respond(200, json=[])
+
+        results = await client.search_books("kościany galeon", fetch_due_dates=False)
+
+    assert len(results) == 1
+    version = results[0].versions[0]
+    assert version.series == "Ja, inkwizytor / Jacek Piekara"
+    assert version.genres == ["Fantastyka", "Powieść"]
+    assert version.subjects == ["Mordimer Madderdin (postać fikcyjna)", "Inkwizycja"]
+    assert version.language == "pol"
 
 
 @pytest.mark.asyncio

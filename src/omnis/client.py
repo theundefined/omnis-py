@@ -101,6 +101,7 @@ class BranchAvailability(BaseModel):
     library_name: str
     library_code: str
     sub_location: Optional[str] = None
+    maps_url: Optional[str] = None
     status: str
     due_date: Optional[str] = None
     overdue: bool = False
@@ -115,6 +116,11 @@ class BookVersion(BaseModel):
     publication_date: Optional[str] = None
     isbns: List[str] = []
     frbrgroupid: Optional[str] = None
+    series: Optional[str] = None
+    genres: List[str] = []
+    subjects: List[str] = []
+    language: Optional[str] = None
+    physical_description: Optional[str] = None
     branches: List[BranchAvailability] = []
 
 
@@ -599,6 +605,7 @@ class OmnisClient:
                         library_name=main_location,
                         library_code=h.get("libraryCode", ""),
                         sub_location=h.get("subLocation"),
+                        maps_url=h.get("stackMapUrl"),
                         status=h.get("availabilityStatus", "unknown"),
                     )
                     branches.append(branch)
@@ -619,6 +626,11 @@ class OmnisClient:
                         publication_date=self._addata_first(v, "date"),
                         isbns=v.get("pnx", {}).get("addata", {}).get("isbn", []),
                         frbrgroupid=frbrgroupid,
+                        series=self._addata_first(v, "seriestitle"),
+                        genres=v.get("pnx", {}).get("display", {}).get("genre", []),
+                        subjects=v.get("pnx", {}).get("display", {}).get("subject", []),
+                        language=self._display_first(v, "language"),
+                        physical_description=self._display_first(v, "format"),
                         branches=branches,
                     )
                 )

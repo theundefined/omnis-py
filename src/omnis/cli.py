@@ -287,20 +287,32 @@ def display_results_table(
         console.print()
 
 
-async def run_search(account: Dict[str, str], query: str, branch_filter: Optional[str] = None):
+async def run_search(
+    account: Dict[str, str],
+    query: str,
+    branch_filter: Optional[str] = None,
+    show_address: bool = False,
+    verbose: bool = False,
+):
     client = OmnisClient(account["base_url"])
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         with console.status(f"[bold green]Searching for '{query}'...[/bold green]", spinner="dots"):
             results = await client.search_books(query, branch_filter=branch_filter)
-        display_search_results(results, query, branch_filter)
+        display_search_results(results, query, branch_filter, show_address, verbose)
     except Exception as e:
         console.print(f"[bold red]Search error:[/bold red] {e}")
     finally:
         await client.close()
 
 
-def display_search_results(results: List[SearchResult], query: str, branch_filter: Optional[str] = None):
+def display_search_results(
+    results: List[SearchResult],
+    query: str,
+    branch_filter: Optional[str] = None,
+    show_address: bool = False,
+    verbose: bool = False,
+):
     if not results:
         suffix = f" (branch: {branch_filter})" if branch_filter else ""
         console.print(f"[italic]No results for '{query}'{suffix}.[/italic]")
@@ -310,11 +322,16 @@ def display_search_results(results: List[SearchResult], query: str, branch_filte
         title_line = f"📖 {result.title}"
         if result.author:
             title_line += f" — {result.author}"
+        series = next((v.series for v in result.versions if v.series), None)
+        if series:
+            title_line += f"\n[dim]{series}[/dim]"
 
         table = Table(title=title_line, show_header=True, header_style="bold")
         table.add_column("Edition", style="dim")
         table.add_column("Year", justify="center")
         table.add_column("Branch", style="magenta")
+        if show_address:
+            table.add_column("Address", style="cyan")
         table.add_column("Status")
 
         for version in result.versions:
@@ -322,7 +339,11 @@ def display_search_results(results: List[SearchResult], query: str, branch_filte
             year = version.publication_date or "-"
 
             if not version.branches:
-                table.add_row(edition_label, year, "[dim]no data[/dim]", "")
+                row = [edition_label, year, "[dim]no data[/dim]"]
+                if show_address:
+                    row.append("")
+                row.append("")
+                table.add_row(*row)
                 continue
 
             for branch in version.branches:
@@ -335,9 +356,35 @@ def display_search_results(results: List[SearchResult], query: str, branch_filte
                         status_display = f"[yellow]Borrowed until {branch.due_date}[/yellow]"
                 else:
                     status_display = "[yellow]Borrowed[/yellow]"
-                table.add_row(edition_label, year, branch.library_name, status_display)
+
+                row = [edition_label, year, branch.library_name]
+                if show_address:
+                    address_display = branch.sub_location or "-"
+                    if branch.maps_url:
+                        address_display = f"{address_display}\n[blue]{branch.maps_url}[/blue]"
+                    row.append(address_display)
+                row.append(status_display)
+                table.add_row(*row)
 
         console.print(table)
+
+        if verbose:
+            for version in result.versions:
+                details = []
+                if version.isbns:
+                    details.append(f"[bold]ISBN:[/bold] {', '.join(version.isbns)}")
+                if version.language:
+                    details.append(f"[bold]Language:[/bold] {version.language}")
+                if version.physical_description:
+                    details.append(f"[bold]Physical:[/bold] {version.physical_description}")
+                if version.genres:
+                    details.append(f"[bold]Genre:[/bold] {', '.join(version.genres)}")
+                if version.subjects:
+                    details.append(f"[bold]Subject:[/bold] {', '.join(version.subjects)}")
+                if details:
+                    panel_title = version.edition or version.publication_date or version.mmsid
+                    console.print(Panel("\n".join(details), title=f"ℹ️  {panel_title}", title_align="left"))
+
         console.print()
 
 
@@ -637,12 +684,20 @@ async def async_main():
         "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Show more details like loan date and renewability"
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show more details: loan date and renewability (default), or genre/subject/ISBN/etc. per edition with --search",
     )
     parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
     parser.add_argument("--search", metavar="QUERY", help="Search the catalog by title/keyword")
     parser.add_argument(
         "--branch", metavar="NAME", help="Filter --search/--branches results to names containing this text"
+    )
+    parser.add_argument(
+        "--address",
+        action="store_true",
+        help="Show branch street address (and maps link) in --search results",
     )
     parser.add_argument(
         "--branches",
@@ -682,7 +737,7 @@ async def async_main():
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
-        await run_search(accounts[0], args.search, args.branch)
+        await run_search(accounts[0], args.search, args.branch, args.address, args.verbose)
         return
 
     if args.add or not accounts:
