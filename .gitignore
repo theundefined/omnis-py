@@ -38,3 +38,7 @@ config_dump.json
 
 # tmp
 curls
+
+# Internal working notes/plans — may contain account numbers or other
+# private data from live API verification; never intended to be committed
+docs/plans/

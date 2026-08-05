@@ -16,7 +16,7 @@ from rich import print as rprint
 
 import httpx
 
-from omnis.client import OmnisClient, UserInfo, Loan, BookDetails, SearchResult
+from omnis.client import OmnisClient, UserInfo, Loan, BookDetails, SearchResult, Fine, RequestItem
 from omnis.tenants import KNOWN_TENANTS
 from omnis.branches import fetch_branches, BranchInfo
 
@@ -64,6 +64,11 @@ def format_due_date(date_str: str) -> str:
         return f"[bold yellow]{full_text}[/bold yellow]"
     else:
         return f"[green]{full_text}[/green]"
+
+
+def _redact_account(account: Dict[str, str]) -> Dict[str, str]:
+    """Strip the plaintext password before an account dict enters any result destined for --format json/csv."""
+    return {k: v for k, v in account.items() if k != "password"}
 
 
 def load_config() -> List[Dict[str, str]]:
@@ -145,9 +150,14 @@ async def fetch_account_data(account: Dict[str, str], details: bool = False, his
             # If not fetching details, just wrap the loan object
             loans_with_details = [{"loan": loan, "details": None} for loan in loans]
 
-        return {"account": account, "user_info": user_info, "loans": loans_with_details, "error": None}
+        return {
+            "account": _redact_account(account),
+            "user_info": user_info,
+            "loans": loans_with_details,
+            "error": None,
+        }
     except Exception as e:
-        return {"account": account, "error": str(e)}
+        return {"account": _redact_account(account), "error": str(e)}
     finally:
         await client.close()
 
@@ -331,6 +341,189 @@ def display_search_results(results: List[SearchResult], query: str, branch_filte
         console.print()
 
 
+async def fetch_account_fines(account: Dict[str, str]) -> Dict[str, Any]:
+    client = OmnisClient(account["base_url"])
+    try:
+        await client.login(account["username"], account["password"], account["institution"], account["view"])
+        fines = await client.get_fines()
+        return {"account": _redact_account(account), "fines": fines, "error": None}
+    except Exception as e:
+        return {"account": _redact_account(account), "error": str(e)}
+    finally:
+        await client.close()
+
+
+async def run_fines(accounts: List[Dict[str, str]], output_format: str = "table"):
+    with console.status("[bold green]Fetching fines...[/bold green]", spinner="dots"):
+        results = await asyncio.gather(*(fetch_account_fines(acc) for acc in accounts))
+
+    if output_format == "json":
+        display_fines_json(results)
+    elif output_format == "csv":
+        display_fines_csv(results)
+    else:
+        display_fines_table(results)
+
+
+def display_fines_table(results: List[Dict[str, Any]]):
+    any_fines = False
+    for res in results:
+        account = res["account"]
+        if res.get("error"):
+            console.print(f"[red]Could not fetch fines for {account['username']}: {res['error']}[/red]")
+            continue
+
+        fines: List[Fine] = res["fines"]
+        if not fines:
+            continue
+        any_fines = True
+
+        table = Table(
+            title=f"💰 {account.get('tenant_name', 'Unknown')} — {account['username']}",
+            show_header=True,
+            header_style="bold",
+        )
+        table.add_column("Date")
+        table.add_column("Title", style="white")
+        table.add_column("Location", style="magenta")
+        table.add_column("Amount", justify="right")
+        table.add_column("Status", style="dim")
+        table.add_column("Description", style="dim")
+
+        for fine in fines:
+            d = parse_date(fine.date)
+            date_display = d.strftime("%Y.%m.%d") if d else fine.date
+
+            amount_display = f"{fine.amount:.2f} {fine.currency}"
+            amount_display = (
+                f"[bold red]{amount_display}[/bold red]" if fine.amount > 0 else f"[dim]{amount_display}[/dim]"
+            )
+
+            table.add_row(date_display, fine.title, fine.location, amount_display, fine.status, fine.description)
+
+        console.print(table)
+        console.print()
+
+    if not any_fines:
+        console.print("[italic]No fines found for any configured account.[/italic]")
+
+
+def display_fines_json(results: List[Dict[str, Any]]):
+    print(json.dumps(results, cls=PydanticEncoder, indent=2))
+
+
+def display_fines_csv(results: List[Dict[str, Any]]):
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        [
+            "account_username",
+            "fine_id",
+            "status",
+            "amount",
+            "currency",
+            "original_amount",
+            "date",
+            "location",
+            "title",
+            "type",
+            "description",
+            "is_alert",
+        ]
+    )
+    for res in results:
+        if res.get("error"):
+            continue
+        for fine in res["fines"]:
+            writer.writerow(
+                [
+                    res["account"]["username"],
+                    fine.id,
+                    fine.status,
+                    fine.amount,
+                    fine.currency,
+                    fine.original_amount,
+                    fine.date,
+                    fine.location,
+                    fine.title,
+                    fine.type,
+                    fine.description,
+                    fine.is_alert,
+                ]
+            )
+
+
+async def fetch_account_requests(account: Dict[str, str]) -> Dict[str, Any]:
+    client = OmnisClient(account["base_url"])
+    try:
+        await client.login(account["username"], account["password"], account["institution"], account["view"])
+        requests = await client.get_requests()
+        return {"account": _redact_account(account), "requests": requests, "error": None}
+    except Exception as e:
+        return {"account": _redact_account(account), "error": str(e)}
+    finally:
+        await client.close()
+
+
+async def run_requests(accounts: List[Dict[str, str]], output_format: str = "table"):
+    with console.status("[bold green]Fetching holds/requests...[/bold green]", spinner="dots"):
+        results = await asyncio.gather(*(fetch_account_requests(acc) for acc in accounts))
+
+    if output_format == "json":
+        display_requests_json(results)
+    elif output_format == "csv":
+        display_requests_csv(results)
+    else:
+        display_requests_table(results)
+
+
+def display_requests_table(results: List[Dict[str, Any]]):
+    # Per-item fields are shown as raw JSON rather than named columns: no family
+    # account has an active hold yet to verify the real shape against (see
+    # docs/plans/account-actions-api.md) — only `category` is trustworthy.
+    any_requests = False
+    for res in results:
+        account = res["account"]
+        if res.get("error"):
+            console.print(f"[red]Could not fetch requests for {account['username']}: {res['error']}[/red]")
+            continue
+
+        items: List[RequestItem] = res["requests"]
+        if not items:
+            continue
+        any_requests = True
+
+        table = Table(
+            title=f"📑 {account.get('tenant_name', 'Unknown')} — {account['username']}",
+            show_header=True,
+            header_style="bold",
+        )
+        table.add_column("Category", style="magenta")
+        table.add_column("Raw data", style="dim")
+
+        for item in items:
+            table.add_row(item.category, json.dumps(item.raw, ensure_ascii=False))
+
+        console.print(table)
+        console.print()
+
+    if not any_requests:
+        console.print("[italic]No active holds/requests found for any configured account.[/italic]")
+
+
+def display_requests_json(results: List[Dict[str, Any]]):
+    print(json.dumps(results, cls=PydanticEncoder, indent=2))
+
+
+def display_requests_csv(results: List[Dict[str, Any]]):
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["account_username", "category", "raw_json"])
+    for res in results:
+        if res.get("error"):
+            continue
+        for item in res["requests"]:
+            writer.writerow([res["account"]["username"], item.category, json.dumps(item.raw, ensure_ascii=False)])
+
+
 async def run_branches(branch_filter: Optional[str] = None):
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         try:
@@ -367,7 +560,7 @@ def display_branches(branches: List[BranchInfo], branch_filter: Optional[str] = 
 
 class PydanticEncoder(json.JSONEncoder):
     def default(self, o):
-        if isinstance(o, (Loan, BookDetails, UserInfo)):
+        if isinstance(o, (Loan, BookDetails, UserInfo, Fine, RequestItem)):
             return o.model_dump()
         return super().default(o)
 
@@ -456,6 +649,13 @@ async def async_main():
         action="store_true",
         help="Show the Biblioteka Raczyńskich branch directory (address, hours, phone, maps link)",
     )
+    parser.add_argument("--fines", action="store_true", help="Show itemized fines for all configured accounts")
+    parser.add_argument(
+        "--requests",
+        action="store_true",
+        help="Show active holds/requests for all configured accounts "
+        "(raw per-item data — shape not fully verified yet, see docs/plans/account-actions-api.md)",
+    )
     args = parser.parse_args()
 
     if args.branches:
@@ -463,6 +663,20 @@ async def async_main():
         return
 
     accounts = load_config()
+
+    if args.fines:
+        if not accounts:
+            rprint("[red]No accounts configured. Add one first with --add.[/red]")
+            return
+        await run_fines(accounts, args.format)
+        return
+
+    if args.requests:
+        if not accounts:
+            rprint("[red]No accounts configured. Add one first with --add.[/red]")
+            return
+        await run_requests(accounts, args.format)
+        return
 
     if args.search:
         if not accounts:

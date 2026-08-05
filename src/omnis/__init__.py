@@ -1,4 +1,4 @@
-from .client import OmnisClient, Loan, UserInfo, SearchResult, BookVersion, BranchAvailability
+from .client import OmnisClient, Loan, UserInfo, SearchResult, BookVersion, BranchAvailability, Fine, RequestItem
 from .tenants import KNOWN_TENANTS, Tenant
 
 __all__ = [
@@ -8,6 +8,8 @@ __all__ = [
     "SearchResult",
     "BookVersion",
     "BranchAvailability",
+    "Fine",
+    "RequestItem",
     "KNOWN_TENANTS",
     "Tenant",
 ]

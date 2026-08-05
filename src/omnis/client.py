@@ -26,6 +26,56 @@ class Loan(BaseModel):
         return cls(**data)
 
 
+_FINE_AMOUNT_RE = re.compile(r"([\d,.]+)\s*(\S+)")
+
+
+def _parse_fine_amount(value: str) -> Tuple[float, str]:
+    """Parse a Polish-formatted fine amount like "0,20 PLN" (comma decimal, currency suffix).
+
+    Distinct from the plain "0.00" format used by myaccount/counters.
+    """
+    match = _FINE_AMOUNT_RE.match((value or "").strip())
+    if not match:
+        return 0.0, ""
+    number, currency = match.groups()
+    return float(number.replace(",", ".")), currency
+
+
+class Fine(BaseModel):
+    id: str = Field(alias="fineid")
+    status: str = Field(alias="finestatus")
+    amount: float
+    currency: str
+    original_amount: float
+    date: str = Field(alias="finedate")
+    location: str = Field(alias="finemainlocation")
+    title: str
+    type: str
+    description: str
+    is_alert: bool = Field(alias="isAlert")
+
+    @classmethod
+    def from_api(cls, data: Dict[str, Any]) -> "Fine":
+        amount, currency = _parse_fine_amount(data.get("finesum", ""))
+        original_amount, _ = _parse_fine_amount(data.get("originalfinesum", ""))
+        data["amount"] = amount
+        data["currency"] = currency
+        data["original_amount"] = original_amount
+        return cls(**data)
+
+
+class RequestItem(BaseModel):
+    """A single hold/photocopy/booking/cdl/ill/acq entry from myaccount/requests.
+
+    Kept as a raw dict rather than named fields: no family account has an active
+    hold to observe the real per-item shape against (see docs/plans/account-actions-api.md),
+    so field names are deliberately not guessed.
+    """
+
+    category: str
+    raw: Dict[str, Any]
+
+
 class BookDetails(BaseModel):
     mmsid: str
     cover_url: Optional[str] = None
@@ -270,6 +320,43 @@ class OmnisClient:
         response = await self.client.get(url, params={"lang": "pl"}, headers=headers)
         response.raise_for_status()
         return response.json().get("data", {})
+
+    async def get_fines(self) -> List[Fine]:
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        url = f"{self.base_url}/primaws/rest/priv/myaccount/fines"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        response = await self.client.get(url, params={"lang": "pl"}, headers=headers)
+        response.raise_for_status()
+        data = response.json().get("data", {})
+        fines_data = data.get("fines", {}).get("fine", [])
+        return [Fine.from_api(f) for f in fines_data]
+
+    async def get_requests(self) -> List[RequestItem]:
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        url = f"{self.base_url}/primaws/rest/priv/myaccount/requests"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        response = await self.client.get(url, params={"lang": "pl"}, headers=headers)
+        response.raise_for_status()
+        data = response.json().get("data", {})
+
+        items: List[RequestItem] = []
+        for plural, singular in (
+            ("holds", "hold"),
+            ("photocopies", "photocopy"),
+            ("bookings", "booking"),
+            ("cdls", "cdl"),
+            ("ills", "ill"),
+            ("acqs", "acq"),
+        ):
+            for entry in data.get(plural, {}).get(singular, []) or []:
+                items.append(RequestItem(category=singular, raw=entry))
+        return items
 
     async def renew_loan(self, loan_id: str) -> Dict[str, Any]:
         if not self.token:

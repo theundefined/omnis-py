@@ -231,3 +231,122 @@ async def test_search_books_requires_login():
     client = OmnisClient()
     with pytest.raises(ValueError):
         await client.search_books("anything")
+
+
+@pytest.mark.asyncio
+async def test_get_fines_parses_polish_amount_format():
+    # Shape verified live against a real account (docs/plans/account-actions-api.md);
+    # amounts use a comma decimal + trailing currency, unlike myaccount/counters' "0.00".
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/fines").respond(
+            200,
+            json={
+                "data": {
+                    "fines": {
+                        "fine": [
+                            {
+                                "fineid": "44652750980009337",
+                                "finestatus": "CLOSED",
+                                "finesum": "0,00 PLN",
+                                "originalfinesum": "0,20 PLN",
+                                "finedate": "20260515",
+                                "finemainlocation": "Filia 35",
+                                "title": "Kocia mowa",
+                                "type": "debit",
+                                "description": "Opłata za przetrzymanie",
+                                "isAlert": False,
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        fines = await client.get_fines()
+
+    assert len(fines) == 1
+    assert fines[0].amount == 0.0
+    assert fines[0].original_amount == 0.2
+    assert fines[0].currency == "PLN"
+    assert fines[0].status == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_get_fines_empty_account_returns_empty_list():
+    # Accounts with no fines return data={} entirely (no "fines" key), not an empty list.
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/fines").respond(
+            200, json={"data": {}}
+        )
+
+        fines = await client.get_fines()
+
+    assert fines == []
+
+
+@pytest.mark.asyncio
+async def test_get_fines_requires_login():
+    client = OmnisClient()
+    with pytest.raises(ValueError):
+        await client.get_fines()
+
+
+@pytest.mark.asyncio
+async def test_get_requests_empty_account_returns_empty_list():
+    # Top-level shape (holds/photocopies/bookings/cdls/ills/acqs) verified live;
+    # no family account currently has an active hold to verify per-item fields against.
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/requests").respond(
+            200,
+            json={
+                "data": {
+                    "holds": {"hold": []},
+                    "photocopies": {"photocopy": []},
+                    "bookings": {"booking": []},
+                    "cdls": {"cdl": []},
+                    "ills": {"ill": []},
+                    "acqs": {"acq": []},
+                }
+            },
+        )
+
+        requests = await client.get_requests()
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_get_requests_tags_items_by_category_and_preserves_raw():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/requests").respond(
+            200,
+            json={
+                "data": {
+                    "holds": {"hold": [{"some": "unverified-field"}]},
+                    "ills": {"ill": [{"another": "field"}]},
+                }
+            },
+        )
+
+        requests = await client.get_requests()
+
+    assert len(requests) == 2
+    assert requests[0].category == "hold"
+    assert requests[0].raw == {"some": "unverified-field"}
+    assert requests[1].category == "ill"
+    assert requests[1].raw == {"another": "field"}
+
+
+@pytest.mark.asyncio
+async def test_get_requests_requires_login():
+    client = OmnisClient()
+    with pytest.raises(ValueError):
+        await client.get_requests()
