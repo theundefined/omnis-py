@@ -336,6 +336,8 @@ def display_search_results(
 
         for version in result.versions:
             edition_label = version.edition or "-"
+            if version.resource_type and version.resource_type.lower() != "book":
+                edition_label = f"{edition_label} [{version.resource_type}]"
             year = version.publication_date or "-"
 
             if not version.branches:

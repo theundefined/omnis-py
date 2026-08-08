@@ -121,6 +121,7 @@ class BookVersion(BaseModel):
     subjects: List[str] = []
     language: Optional[str] = None
     physical_description: Optional[str] = None
+    resource_type: Optional[str] = None
     branches: List[BranchAvailability] = []
 
 
@@ -631,6 +632,7 @@ class OmnisClient:
                         subjects=v.get("pnx", {}).get("display", {}).get("subject", []),
                         language=self._display_first(v, "language"),
                         physical_description=self._display_first(v, "format"),
+                        resource_type=self._display_first(v, "type"),
                         branches=branches,
                     )
                 )
