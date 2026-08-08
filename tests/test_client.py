@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import respx
 from omnis.client import OmnisClient
@@ -406,8 +408,53 @@ async def test_get_requests_tags_items_by_category_and_preserves_raw():
     assert len(requests) == 2
     assert requests[0].category == "hold"
     assert requests[0].raw == {"some": "unverified-field"}
+    assert requests[0].hold is None  # doesn't match the verified Hold shape, falls back to raw
     assert requests[1].category == "ill"
     assert requests[1].raw == {"another": "field"}
+
+
+@pytest.mark.asyncio
+async def test_get_requests_parses_hold_shape():
+    # Shape verified live against a real account with an active hold (see
+    # docs/plans/account-actions-api.md) — "Y"/"N" flags convert to bool.
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get("https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/requests").respond(
+            200,
+            json={
+                "data": {
+                    "holds": {
+                        "hold": [
+                            {
+                                "cancel": "Y",
+                                "ilsinstitutionname": "Sprawdź dostępność w innych bibliotekach",
+                                "ilsinstitutioncode": "48OMNIS_NETWORK",
+                                "mmsid": "9910805835105606",
+                                "title": "Przykładowa książka",
+                                "author": "Testowy, Autor",
+                                "pickuplocationname": "Filia 01",
+                                "available": "N",
+                                "requestid": "45519739360009337",
+                                "requestdate": "20260808",
+                                "holdstatus": "W realizacji",
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        requests = await client.get_requests()
+
+    assert len(requests) == 1
+    hold = requests[0].hold
+    assert hold is not None
+    assert hold.title == "Przykładowa książka"
+    assert hold.status == "W realizacji"
+    assert hold.pickup_location == "Filia 01"
+    assert hold.available is False
+    assert hold.cancellable is True
 
 
 @pytest.mark.asyncio
@@ -415,3 +462,29 @@ async def test_get_requests_requires_login():
     client = OmnisClient()
     with pytest.raises(ValueError):
         await client.get_requests()
+
+
+@pytest.mark.asyncio
+async def test_cancel_hold_sends_verified_payload():
+    # Endpoint/payload captured live from the browser's own cancel action (curls/anulowanie):
+    # request_type is "holds" (plural category key), not "hold".
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        route = respx.post(
+            "https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/cancel_requests"
+        ).respond(200, json={"success": True})
+
+        result = await client.cancel_hold("45519739360009337")
+
+    assert route.called
+    sent_request = route.calls.last.request
+    assert json.loads(sent_request.content) == {"request_id": "45519739360009337", "request_type": "holds"}
+    assert result == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_cancel_hold_requires_login():
+    client = OmnisClient()
+    with pytest.raises(ValueError):
+        await client.cancel_hold("45519739360009337")

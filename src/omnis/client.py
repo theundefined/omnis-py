@@ -2,7 +2,7 @@ import asyncio
 import re
 import httpx
 from typing import Any, Dict, List, Optional, Tuple
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 
 class Loan(BaseModel):
@@ -64,16 +64,47 @@ class Fine(BaseModel):
         return cls(**data)
 
 
+class Hold(BaseModel):
+    """A single `hold` entry from myaccount/requests, shape verified live (see
+    docs/plans/account-actions-api.md). Only the `hold` category has been observed
+    against a real account so far — photocopy/booking/cdl/ill/acq entries stay as
+    raw dicts on `RequestItem` until one of those is verified too.
+    """
+
+    request_id: str = Field(alias="requestid")
+    title: str
+    status: str = Field(alias="holdstatus")
+    available: bool
+    cancellable: bool
+    author: Optional[str] = None
+    pickup_location: Optional[str] = Field(None, alias="pickuplocationname")
+    request_date: Optional[str] = Field(None, alias="requestdate")
+    mmsid: Optional[str] = None
+    ils_institution_name: Optional[str] = Field(None, alias="ilsinstitutionname")
+    ils_institution_code: Optional[str] = Field(None, alias="ilsinstitutioncode")
+
+    @classmethod
+    def from_api(cls, data: Dict[str, Any]) -> "Hold":
+        data = dict(data)
+        data["available"] = data.get("available") == "Y"
+        data["cancellable"] = data.get("cancel") == "Y"
+        return cls(**data)
+
+
 class RequestItem(BaseModel):
     """A single hold/photocopy/booking/cdl/ill/acq entry from myaccount/requests.
 
-    Kept as a raw dict rather than named fields: no family account has an active
-    hold to observe the real per-item shape against (see docs/plans/account-actions-api.md),
-    so field names are deliberately not guessed.
+    Kept as a raw dict rather than named fields for categories other than `hold`:
+    no family account has had an active photocopy/booking/cdl/ill/acq to observe
+    the real per-item shape against (see docs/plans/account-actions-api.md), so
+    those field names are deliberately not guessed. `hold` is populated whenever
+    the raw entry parses cleanly against the verified `Hold` shape; `raw` is kept
+    regardless so nothing is lost if a future account shows an unverified variant.
     """
 
     category: str
     raw: Dict[str, Any]
+    hold: Optional[Hold] = None
 
 
 class BookDetails(BaseModel):
@@ -362,7 +393,13 @@ class OmnisClient:
             ("acqs", "acq"),
         ):
             for entry in data.get(plural, {}).get(singular, []) or []:
-                items.append(RequestItem(category=singular, raw=entry))
+                hold = None
+                if singular == "hold":
+                    try:
+                        hold = Hold.from_api(entry)
+                    except ValidationError:
+                        hold = None
+                items.append(RequestItem(category=singular, raw=entry, hold=hold))
         return items
 
     async def renew_loan(self, loan_id: str) -> Dict[str, Any]:
@@ -375,6 +412,22 @@ class OmnisClient:
         data = {"id": loan_id}
 
         response = await self.client.post(renew_url, params=params, headers=headers, json=data)
+        response.raise_for_status()
+        return response.json()
+
+    async def cancel_hold(self, request_id: str) -> Dict[str, Any]:
+        """Cancel a hold. Endpoint/payload shape captured live from the browser's own
+        cancel action (see curls/anulowanie) rather than guessed from convention:
+        `request_type` is "holds" (the plural category key), not "hold"."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        cancel_url = f"{self.base_url}/primaws/rest/priv/myaccount/cancel_requests"
+        params = {"lang": "pl"}
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json;charset=UTF-8"}
+        data = {"request_id": request_id, "request_type": "holds"}
+
+        response = await self.client.post(cancel_url, params=params, headers=headers, json=data)
         response.raise_for_status()
         return response.json()
 

@@ -525,10 +525,44 @@ async def run_requests(accounts: List[Dict[str, str]], output_format: str = "tab
         display_requests_table(results)
 
 
+async def run_cancel_hold(accounts: List[Dict[str, str]], request_id: str):
+    # Search each account for the hold rather than requiring the user to name an
+    # account: request IDs are already unique, and this avoids accidentally
+    # cancelling on the wrong account if the caller mistypes --add order.
+    for account in accounts:
+        client = OmnisClient(account["base_url"])
+        try:
+            await client.login(account["username"], account["password"], account["institution"], account["view"])
+            items = await client.get_requests()
+        except Exception as e:
+            console.print(f"[red]Could not check {account['username']}: {e}[/red]")
+            await client.close()
+            continue
+
+        hold = next((item.hold for item in items if item.hold and item.hold.request_id == request_id), None)
+        if not hold:
+            await client.close()
+            continue
+
+        label = account.get("tenant_name", account["username"])
+        console.print(f"[bold]Cancelling hold[/bold] '{hold.title}' — {label} ({account['username']})...")
+        try:
+            await client.cancel_hold(request_id)
+            console.print("[green]Hold cancelled.[/green]")
+        except Exception as e:
+            console.print(f"[red]Cancellation failed: {e}[/red]")
+        finally:
+            await client.close()
+        return
+
+    console.print(f"[red]No active hold with request ID '{request_id}' found on any configured account.[/red]")
+
+
 def display_requests_table(results: List[Dict[str, Any]]):
-    # Per-item fields are shown as raw JSON rather than named columns: no family
-    # account has an active hold yet to verify the real shape against (see
-    # docs/plans/account-actions-api.md) — only `category` is trustworthy.
+    # `hold` items get a typed table (shape verified live, see
+    # docs/plans/account-actions-api.md). Other categories (photocopy/booking/cdl/ill/acq)
+    # are still shown as raw JSON: no family account has had one of those to verify the
+    # real shape against — only `category` is trustworthy for them.
     any_requests = False
     for res in results:
         account = res["account"]
@@ -541,19 +575,55 @@ def display_requests_table(results: List[Dict[str, Any]]):
             continue
         any_requests = True
 
-        table = Table(
-            title=f"📑 {account.get('tenant_name', 'Unknown')} — {account['username']}",
-            show_header=True,
-            header_style="bold",
-        )
-        table.add_column("Category", style="magenta")
-        table.add_column("Raw data", style="dim")
+        holds = [item.hold for item in items if item.hold]
+        other_items = [item for item in items if not item.hold]
 
-        for item in items:
-            table.add_row(item.category, json.dumps(item.raw, ensure_ascii=False))
+        if holds:
+            table = Table(
+                title=f"📚 {account.get('tenant_name', 'Unknown')} — {account['username']} — Holds",
+                show_header=True,
+                header_style="bold",
+            )
+            table.add_column("Title", style="magenta")
+            table.add_column("Status")
+            table.add_column("Ready for pickup")
+            table.add_column("Pickup location")
+            table.add_column("Requested")
+            table.add_column("Cancellable")
 
-        console.print(table)
-        console.print()
+            for hold in holds:
+                available_display = "[green]Yes[/green]" if hold.available else "[yellow]No[/yellow]"
+                cancellable_display = "[green]Yes[/green]" if hold.cancellable else "No"
+                requested_date = parse_date(hold.request_date) if hold.request_date else None
+                requested_display = (
+                    requested_date.strftime("%d/%m/%Y") if requested_date else (hold.request_date or "-")
+                )
+                table.add_row(
+                    hold.title,
+                    hold.status,
+                    available_display,
+                    hold.pickup_location or "-",
+                    requested_display,
+                    cancellable_display,
+                )
+
+            console.print(table)
+            console.print()
+
+        if other_items:
+            table = Table(
+                title=f"📑 {account.get('tenant_name', 'Unknown')} — {account['username']}",
+                show_header=True,
+                header_style="bold",
+            )
+            table.add_column("Category", style="magenta")
+            table.add_column("Raw data", style="dim")
+
+            for item in other_items:
+                table.add_row(item.category, json.dumps(item.raw, ensure_ascii=False))
+
+            console.print(table)
+            console.print()
 
     if not any_requests:
         console.print("[italic]No active holds/requests found for any configured account.[/italic]")
@@ -711,7 +781,12 @@ async def async_main():
         "--requests",
         action="store_true",
         help="Show active holds/requests for all configured accounts "
-        "(raw per-item data — shape not fully verified yet, see docs/plans/account-actions-api.md)",
+        "(holds are shown in a typed table; other categories are still raw — see docs/plans/account-actions-api.md)",
+    )
+    parser.add_argument(
+        "--cancel-hold",
+        metavar="REQUEST_ID",
+        help="Cancel a hold by its request ID (as shown in --requests output)",
     )
     args = parser.parse_args()
 
@@ -733,6 +808,13 @@ async def async_main():
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
         await run_requests(accounts, args.format)
+        return
+
+    if args.cancel_hold:
+        if not accounts:
+            rprint("[red]No accounts configured. Add one first with --add.[/red]")
+            return
+        await run_cancel_hold(accounts, args.cancel_hold)
         return
 
     if args.search:
