@@ -1,8 +1,19 @@
 import json
 
+import httpx
 import pytest
 import respx
 from omnis.client import OmnisClient
+
+
+def test_client_default_timeout_is_30():
+    client = OmnisClient()
+    assert client.client.timeout == httpx.Timeout(30.0)
+
+
+def test_client_custom_timeout_applied():
+    client = OmnisClient(timeout=60.0)
+    assert client.client.timeout == httpx.Timeout(60.0)
 
 
 def _doc(

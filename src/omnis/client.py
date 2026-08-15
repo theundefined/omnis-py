@@ -168,13 +168,15 @@ class OmnisClient:
         self,
         base_url: str = "https://omnis-br.primo.exlibrisgroup.com",
         client: Optional[httpx.AsyncClient] = None,
+        timeout: float = 30.0,
     ):
         self.base_url = base_url
         if client:
+            # timeout is ignored here: an externally-provided client already has its own.
             self.client = client
             self._close_client = False
         else:
-            self.client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+            self.client = httpx.AsyncClient(follow_redirects=True, timeout=timeout)
             self._close_client = True
 
         self.token: Optional[str] = None

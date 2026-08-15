@@ -17,11 +17,16 @@ from rich import print as rprint
 import httpx
 
 from omnis.client import OmnisClient, UserInfo, Loan, BookDetails, SearchResult, Fine, RequestItem
-from omnis.tenants import KNOWN_TENANTS
+from omnis.tenants import KNOWN_TENANTS, MOCK_TENANT
 from omnis.branches import fetch_branches, BranchInfo
 
 CONFIG_DIR = Path.home() / ".config" / "omnis-py"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
+
+# omnis-mock's fixed demo account — publicly documented as not-secret in its own SPEC.md,
+# safe to keep in source.
+DEMO_USERNAME = "demo"
+DEMO_PASSWORD = "demo1234"
 
 console = Console()
 
@@ -66,12 +71,12 @@ def format_due_date(date_str: str) -> str:
         return f"[green]{full_text}[/green]"
 
 
-def _redact_account(account: Dict[str, str]) -> Dict[str, str]:
+def _redact_account(account: Dict[str, Any]) -> Dict[str, Any]:
     """Strip the plaintext password before an account dict enters any result destined for --format json/csv."""
     return {k: v for k, v in account.items() if k != "password"}
 
 
-def load_config() -> List[Dict[str, str]]:
+def load_config() -> List[Dict[str, Any]]:
     if not CONFIG_FILE.exists():
         return []
     try:
@@ -83,14 +88,14 @@ def load_config() -> List[Dict[str, str]]:
         return []
 
 
-def save_config(accounts: List[Dict[str, str]]):
+def save_config(accounts: List[Dict[str, Any]]):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         yaml.safe_dump({"accounts": accounts}, f)
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
 
 
-def add_account_wizard() -> Dict[str, str]:
+def add_account_wizard() -> Dict[str, Any]:
     rprint(Panel.fit("Add New Library Account", style="bold blue"))
 
     # Select Tenant
@@ -116,7 +121,7 @@ def add_account_wizard() -> Dict[str, str]:
     username = Prompt.ask("Username (Card Number)")
     password = Prompt.ask("Password", password=True)
 
-    return {
+    account: Dict[str, Any] = {
         "username": username,
         "password": password,
         "base_url": base_url,
@@ -124,10 +129,112 @@ def add_account_wizard() -> Dict[str, str]:
         "view": view,
         "tenant_name": tenant_name,
     }
+    if selected_tenant.get("is_demo"):
+        account["is_demo"] = True
+    if "default_timeout" in selected_tenant:
+        account["timeout"] = selected_tenant["default_timeout"]
+    return account
 
 
-async def fetch_account_data(account: Dict[str, str], details: bool = False, history: bool = False) -> Dict[str, Any]:
-    client = OmnisClient(account["base_url"])
+def _enabled_accounts(accounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Accounts with enabled != False. A missing key counts as enabled, so configs
+    written before this field existed keep working unchanged."""
+    return [a for a in accounts if a.get("enabled", True)]
+
+
+def _set_account_enabled(accounts: List[Dict[str, Any]], index: int, enabled: bool) -> None:
+    """index is 1-based, matching the numbering shown by --list-accounts/add_account_wizard."""
+    account = accounts[index - 1]
+    account["enabled"] = enabled
+    if enabled:
+        # Manually re-enabling clears the demo-mode marker so a later --exit-demo won't
+        # also try to toggle an account the user already restored themselves.
+        account.pop("disabled_by_demo", None)
+
+
+def _set_account_timeout(accounts: List[Dict[str, Any]], index: int, seconds: float) -> None:
+    accounts[index - 1]["timeout"] = seconds
+
+
+def _make_demo_account() -> Dict[str, Any]:
+    return {
+        "username": DEMO_USERNAME,
+        "password": DEMO_PASSWORD,
+        "base_url": MOCK_TENANT["base_url"],
+        "institution": MOCK_TENANT["institution"],
+        "view": MOCK_TENANT["view"],
+        "tenant_name": MOCK_TENANT["name"],
+        "is_demo": True,
+        "enabled": True,
+        "timeout": MOCK_TENANT["default_timeout"],
+    }
+
+
+def _apply_demo_mode(accounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Disable every currently-enabled non-demo account (tagged disabled_by_demo=True so
+    _exit_demo_mode knows what to restore), then ensure exactly one enabled demo account
+    exists — reusing an existing demo account if present (refreshing its credentials/tenant
+    fields in case they were ever hand-edited), otherwise appending a fresh one. Idempotent:
+    calling this twice in a row does not create a second demo account."""
+    demo_account = None
+    for account in accounts:
+        if account.get("is_demo"):
+            demo_account = account
+            continue
+        if account.get("enabled", True):
+            account["enabled"] = False
+            account["disabled_by_demo"] = True
+
+    if demo_account is not None:
+        demo_account.update(_make_demo_account())
+    else:
+        accounts.append(_make_demo_account())
+
+    return accounts
+
+
+def _exit_demo_mode(accounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Disable every enabled demo account, and re-enable (clearing the marker) every account
+    that _apply_demo_mode had disabled. Accounts the user had disabled before --demo, unrelated
+    to it, are deliberately left disabled."""
+    for account in accounts:
+        if account.get("is_demo") and account.get("enabled", True):
+            account["enabled"] = False
+        if account.pop("disabled_by_demo", False):
+            account["enabled"] = True
+    return accounts
+
+
+def display_accounts_table(accounts: List[Dict[str, Any]]) -> None:
+    table = Table(title="Configured Accounts")
+    table.add_column("Index", justify="right")
+    table.add_column("Library", style="magenta")
+    table.add_column("Username", style="cyan")
+    table.add_column("Enabled", justify="center")
+    table.add_column("Timeout (s)", justify="right")
+
+    if not accounts:
+        console.print("[italic]No accounts configured. Add one with --add.[/italic]")
+        return
+
+    for idx, account in enumerate(accounts, 1):
+        name = account.get("tenant_name", "Unknown")
+        if account.get("is_demo"):
+            name = f"{name} [dim](demo)[/dim]"
+        enabled_display = "[green]✓[/green]" if account.get("enabled", True) else "[red]✗[/red]"
+        table.add_row(
+            str(idx),
+            name,
+            account.get("username", ""),
+            enabled_display,
+            str(account.get("timeout", 30.0)),
+        )
+
+    console.print(table)
+
+
+async def fetch_account_data(account: Dict[str, Any], details: bool = False, history: bool = False) -> Dict[str, Any]:
+    client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         user_info = await client.get_user_info()
@@ -288,13 +395,13 @@ def display_results_table(
 
 
 async def run_search(
-    account: Dict[str, str],
+    account: Dict[str, Any],
     query: str,
     branch_filter: Optional[str] = None,
     show_address: bool = False,
     verbose: bool = False,
 ):
-    client = OmnisClient(account["base_url"])
+    client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         with console.status(f"[bold green]Searching for '{query}'...[/bold green]", spinner="dots"):
@@ -390,8 +497,8 @@ def display_search_results(
         console.print()
 
 
-async def fetch_account_fines(account: Dict[str, str]) -> Dict[str, Any]:
-    client = OmnisClient(account["base_url"])
+async def fetch_account_fines(account: Dict[str, Any]) -> Dict[str, Any]:
+    client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         fines = await client.get_fines()
@@ -402,7 +509,7 @@ async def fetch_account_fines(account: Dict[str, str]) -> Dict[str, Any]:
         await client.close()
 
 
-async def run_fines(accounts: List[Dict[str, str]], output_format: str = "table"):
+async def run_fines(accounts: List[Dict[str, Any]], output_format: str = "table"):
     with console.status("[bold green]Fetching fines...[/bold green]", spinner="dots"):
         results = await asyncio.gather(*(fetch_account_fines(acc) for acc in accounts))
 
@@ -501,8 +608,8 @@ def display_fines_csv(results: List[Dict[str, Any]]):
             )
 
 
-async def fetch_account_requests(account: Dict[str, str]) -> Dict[str, Any]:
-    client = OmnisClient(account["base_url"])
+async def fetch_account_requests(account: Dict[str, Any]) -> Dict[str, Any]:
+    client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
     try:
         await client.login(account["username"], account["password"], account["institution"], account["view"])
         requests = await client.get_requests()
@@ -513,7 +620,7 @@ async def fetch_account_requests(account: Dict[str, str]) -> Dict[str, Any]:
         await client.close()
 
 
-async def run_requests(accounts: List[Dict[str, str]], output_format: str = "table"):
+async def run_requests(accounts: List[Dict[str, Any]], output_format: str = "table"):
     with console.status("[bold green]Fetching holds/requests...[/bold green]", spinner="dots"):
         results = await asyncio.gather(*(fetch_account_requests(acc) for acc in accounts))
 
@@ -525,12 +632,12 @@ async def run_requests(accounts: List[Dict[str, str]], output_format: str = "tab
         display_requests_table(results)
 
 
-async def run_cancel_hold(accounts: List[Dict[str, str]], request_id: str):
+async def run_cancel_hold(accounts: List[Dict[str, Any]], request_id: str):
     # Search each account for the hold rather than requiring the user to name an
     # account: request IDs are already unique, and this avoids accidentally
     # cancelling on the wrong account if the caller mistypes --add order.
     for account in accounts:
-        client = OmnisClient(account["base_url"])
+        client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
         try:
             await client.login(account["username"], account["password"], account["institution"], account["view"])
             items = await client.get_requests()
@@ -788,6 +895,29 @@ async def async_main():
         metavar="REQUEST_ID",
         help="Cancel a hold by its request ID (as shown in --requests output)",
     )
+    parser.add_argument(
+        "--list-accounts",
+        action="store_true",
+        help="List all configured accounts with index, enabled status, and timeout",
+    )
+    parser.add_argument("--enable", type=int, metavar="INDEX", help="Enable account by index (see --list-accounts)")
+    parser.add_argument("--disable", type=int, metavar="INDEX", help="Disable account by index (see --list-accounts)")
+    parser.add_argument(
+        "--set-timeout",
+        nargs=2,
+        metavar=("INDEX", "SECONDS"),
+        help="Set per-account HTTP timeout in seconds by index (see --list-accounts)",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Switch to demo mode: disable all non-demo accounts and enable/create the omnis-mock demo account",
+    )
+    parser.add_argument(
+        "--exit-demo",
+        action="store_true",
+        help="Exit demo mode: disable the demo account and re-enable accounts that --demo had disabled",
+    )
     args = parser.parse_args()
 
     if args.branches:
@@ -796,32 +926,109 @@ async def async_main():
 
     accounts = load_config()
 
+    if args.list_accounts:
+        display_accounts_table(accounts)
+        return
+
+    if args.enable is not None:
+        try:
+            _set_account_enabled(accounts, args.enable, True)
+        except IndexError:
+            rprint(f"[red]No account at index {args.enable}. Use --list-accounts to see valid indices.[/red]")
+            return
+        save_config(accounts)
+        return
+
+    if args.disable is not None:
+        try:
+            _set_account_enabled(accounts, args.disable, False)
+        except IndexError:
+            rprint(f"[red]No account at index {args.disable}. Use --list-accounts to see valid indices.[/red]")
+            return
+        save_config(accounts)
+        return
+
+    if args.set_timeout is not None:
+        try:
+            idx = int(args.set_timeout[0])
+            seconds = float(args.set_timeout[1])
+            if seconds <= 0:
+                raise ValueError("timeout must be positive")
+            _set_account_timeout(accounts, idx, seconds)
+        except (ValueError, IndexError) as e:
+            rprint(f"[red]Invalid --set-timeout arguments: {e}[/red]")
+            return
+        save_config(accounts)
+        return
+
+    if args.demo:
+        accounts = _apply_demo_mode(accounts)
+        save_config(accounts)
+        rprint("[bold green]Demo mode enabled.[/bold green] Using omnis-mock (https://omnis-mock.onrender.com).")
+        rprint(
+            "[dim]Note: the first request may take ~50s if the free-tier mock server is cold "
+            "(Render cold start).[/dim]"
+        )
+        return
+
+    if args.exit_demo:
+        accounts = _exit_demo_mode(accounts)
+        save_config(accounts)
+        rprint("[bold green]Demo mode disabled.[/bold green] Restored previously enabled accounts.")
+        return
+
+    active_accounts = _enabled_accounts(accounts)
+
     if args.fines:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
-        await run_fines(accounts, args.format)
+        if not active_accounts:
+            rprint(
+                "[yellow]No enabled accounts. Use --list-accounts to see accounts, --enable INDEX to "
+                "enable one, or --demo for the demo account.[/yellow]"
+            )
+            return
+        await run_fines(active_accounts, args.format)
         return
 
     if args.requests:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
-        await run_requests(accounts, args.format)
+        if not active_accounts:
+            rprint(
+                "[yellow]No enabled accounts. Use --list-accounts to see accounts, --enable INDEX to "
+                "enable one, or --demo for the demo account.[/yellow]"
+            )
+            return
+        await run_requests(active_accounts, args.format)
         return
 
     if args.cancel_hold:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
-        await run_cancel_hold(accounts, args.cancel_hold)
+        if not active_accounts:
+            rprint(
+                "[yellow]No enabled accounts. Use --list-accounts to see accounts, --enable INDEX to "
+                "enable one, or --demo for the demo account.[/yellow]"
+            )
+            return
+        await run_cancel_hold(active_accounts, args.cancel_hold)
         return
 
     if args.search:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
-        await run_search(accounts[0], args.search, args.branch, args.address, args.verbose)
+        if not active_accounts:
+            rprint(
+                "[yellow]No enabled accounts. Use --list-accounts to see accounts, --enable INDEX to "
+                "enable one, or --demo for the demo account.[/yellow]"
+            )
+            return
+        await run_search(active_accounts[0], args.search, args.branch, args.address, args.verbose)
         return
 
     if args.add or not accounts:
@@ -843,11 +1050,19 @@ async def async_main():
         rprint("[red]No accounts configured. Exiting.[/red]")
         return
 
+    active_accounts = _enabled_accounts(accounts)
+    if not active_accounts:
+        rprint(
+            "[yellow]No enabled accounts. Use --list-accounts to see accounts, --enable INDEX to "
+            "enable one, or --demo for the demo account.[/yellow]"
+        )
+        return
+
     # If requested, attempt to renew loans before fetching data so updated due dates are shown
     if args.renew and not args.history:
         rprint("\n[bold green]Attempting to renew renewable loans for all accounts...[/bold green]")
-        for account in accounts:
-            client = OmnisClient(account["base_url"])
+        for account in active_accounts:
+            client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
             try:
                 await client.login(
                     account["username"], account["password"], account.get("institution"), account.get("view")
@@ -894,7 +1109,7 @@ async def async_main():
     with console.status(
         f"[bold green]Fetching library {'history' if args.history else 'data'}...[/bold green]", spinner="dots"
     ):
-        tasks = [fetch_account_data(acc, fetch_details, args.history) for acc in accounts]
+        tasks = [fetch_account_data(acc, fetch_details, args.history) for acc in active_accounts]
         results = await asyncio.gather(*tasks)
 
     if args.format == "table":

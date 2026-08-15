@@ -27,6 +27,7 @@ Biblioteka jest uniwersalna i obsługuje m.in.:
 - Koszalińska Biblioteka Publiczna
 - Książnica Zamojska
 - ...oraz każdą inną bibliotekę Primo po podaniu jej adresu URL i kodu instytucji.
+- **Nieoficjalna Biblioteka OMNIS (Demo)** — publiczny mock serwera Primo ([omnis-mock](https://github.com/theundefined/omnis-mock)) z gotowym kontem testowym, bez potrzeby posiadania prawdziwej karty bibliotecznej. Zobacz `--demo` poniżej.
 
 ### Instalacja
 
@@ -52,6 +53,11 @@ Przy pierwszym uruchomieniu program poprowadzi Cię przez kreator dodawania kont
 - `omnis-cli --search "..." --branch "nazwa filii"` - jak wyżej, ale ogranicza wyniki do filii, których nazwa zawiera podany fragment (bez rozróżniania wielkości liter).
 - `omnis-cli --branches` - pokazuje katalog filii Biblioteki Raczyńskich (adres, godziny otwarcia, telefon, link do Google Maps). Nie wymaga skonfigurowanego konta - dane pochodzą bezpośrednio ze strony bracz.edu.pl. Działa wyłącznie dla Biblioteki Raczyńskich.
 - `omnis-cli --branches --branch "Filia 35"` - jak wyżej, ograniczone do filii, których nazwa zawiera podany fragment.
+- `omnis-cli --list-accounts` - wyświetla skonfigurowane konta z numerem (indeksem), biblioteką, nazwą użytkownika, statusem włączenia i timeoutem.
+- `omnis-cli --enable N` / `omnis-cli --disable N` - włącza/wyłącza konto o podanym numerze indeksu (z `--list-accounts`), bez usuwania go z konfiguracji.
+- `omnis-cli --set-timeout N SEKUNDY` - ustawia niestandardowy timeout HTTP (w sekundach) dla konta o podanym indeksie.
+- `omnis-cli --demo` - przełącza się w tryb demo: wyłącza wszystkie skonfigurowane konta prawdziwych bibliotek i włącza (lub dodaje, jeśli jeszcze nie istnieje) konto testowe wskazujące na [omnis-mock](https://github.com/theundefined/omnis-mock) — publiczny, samowystarczalny mock API Primo z fikcyjnymi wypożyczeniami. Wygodne do wypróbowania narzędzia bez podawania prawdziwych danych logowania. Pierwsze zapytanie może potrwać do ok. 50 sekund, jeśli darmowa instancja mocka na Render "obudziła się" po dłuższej bezczynności.
+- `omnis-cli --exit-demo` - wychodzi z trybu demo: wyłącza konto testowe i przywraca (włącza z powrotem) konta, które zostały automatycznie wyłączone przez `--demo`.
 
 Przykład wyszukiwania krok po kroku (cały cykl książek, z priorytetem konkretnych filii): [docs/examples/plomien-i-krzyz.md](docs/examples/plomien-i-krzyz.md).
 
@@ -77,6 +83,7 @@ The library is generic and supports various institutions including:
 - Jagiellonian University (Kraków)
 - Nicolaus Copernicus University (Toruń)
 - ...and any other Primo library by providing its URL and institution code.
+- **Nieoficjalna Biblioteka OMNIS (Demo)** — a public mock Primo server ([omnis-mock](https://github.com/theundefined/omnis-mock)) with a ready-made test account, no real library card needed. See `--demo` below.
 
 ### Installation
 
@@ -102,6 +109,11 @@ On first run, it will guide you through adding an account. Configuration is stor
 - `omnis-cli --search "..." --branch "branch name"` - as above, but limited to branches whose name contains the given text (case-insensitive).
 - `omnis-cli --branches` - shows the Biblioteka Raczyńskich branch directory (address, opening hours, phone, Google Maps link). No account required - data comes directly from bracz.edu.pl. Works for Biblioteka Raczyńskich only.
 - `omnis-cli --branches --branch "Filia 35"` - as above, limited to branches whose name contains the given text.
+- `omnis-cli --list-accounts` - lists configured accounts with their index, library, username, enabled status, and timeout.
+- `omnis-cli --enable N` / `omnis-cli --disable N` - enables/disables the account at the given index (from `--list-accounts`), without removing it from the configuration.
+- `omnis-cli --set-timeout N SECONDS` - sets a custom HTTP timeout (in seconds) for the account at the given index.
+- `omnis-cli --demo` - switches to demo mode: disables all configured real-library accounts and enables (or creates, if it doesn't exist yet) a demo account pointing at [omnis-mock](https://github.com/theundefined/omnis-mock) — a public, self-contained mock of the Primo API with fake loans. Handy for trying out the tool without real login credentials. The first request may take up to ~50 seconds if the free-tier mock instance on Render needs to wake up from being idle.
+- `omnis-cli --exit-demo` - exits demo mode: disables the demo account and restores (re-enables) the accounts that `--demo` had automatically disabled.
 
 ---
 

@@ -1,4 +1,4 @@
-from typing import List, TypedDict
+from typing import List, NotRequired, TypedDict
 
 
 class Tenant(TypedDict):
@@ -6,6 +6,20 @@ class Tenant(TypedDict):
     base_url: str
     institution: str
     view: str
+    is_demo: NotRequired[bool]
+    default_timeout: NotRequired[float]
+
+
+MOCK_TENANT: Tenant = {
+    "name": "Nieoficjalna Biblioteka OMNIS (Demo)",
+    "base_url": "https://omnis-mock.onrender.com",
+    "institution": "MOCK",
+    "view": "MOCK:MOCK",
+    "is_demo": True,
+    # Higher than the client's default 30s timeout: the free Render tier this mock
+    # runs on cold-starts after 15 min of inactivity, taking 50s+ to respond.
+    "default_timeout": 60.0,
+}
 
 
 KNOWN_TENANTS: List[Tenant] = [
@@ -69,5 +83,6 @@ KNOWN_TENANTS: List[Tenant] = [
         "institution": "48OMNIS_ZAM",
         "view": "48OMNIS_ZAM:ZAM_1",
     },
+    MOCK_TENANT,
     {"name": "Custom / Własna...", "base_url": "", "institution": "", "view": ""},
 ]
