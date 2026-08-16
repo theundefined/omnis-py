@@ -490,6 +490,9 @@ def display_search_results(
                     details.append(f"[bold]Genre:[/bold] {', '.join(version.genres)}")
                 if version.subjects:
                     details.append(f"[bold]Subject:[/bold] {', '.join(version.subjects)}")
+                if version.other_institutions:
+                    other_names = ", ".join(inst.name for inst in version.other_institutions)
+                    details.append(f"[bold]Also at:[/bold] {other_names}")
                 if details:
                     panel_title = version.edition or version.publication_date or version.mmsid
                     console.print(Panel("\n".join(details), title=f"ℹ️  {panel_title}", title_align="left"))

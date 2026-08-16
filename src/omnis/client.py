@@ -138,6 +138,11 @@ class BranchAvailability(BaseModel):
     overdue: bool = False
 
 
+class OtherInstitution(BaseModel):
+    code: str
+    name: str
+
+
 class BookVersion(BaseModel):
     mmsid: str
     title: str
@@ -154,6 +159,7 @@ class BookVersion(BaseModel):
     physical_description: Optional[str] = None
     resource_type: Optional[str] = None
     branches: List[BranchAvailability] = []
+    other_institutions: List[OtherInstitution] = []
 
 
 class SearchResult(BaseModel):
@@ -650,7 +656,12 @@ class OmnisClient:
             for v in versions:
                 alma_id = self._alma_id(v)
                 delivery_item = delivery_by_id.get(alma_id, {}) if alma_id else {}
-                holdings = (delivery_item.get("delivery") or {}).get("holding") or []
+                delivery_data = delivery_item.get("delivery") or {}
+                holdings = delivery_data.get("holding") or []
+                other_institutions = [
+                    OtherInstitution(code=inst.get("instCode", ""), name=inst.get("instName", ""))
+                    for inst in delivery_data.get("almaInstitutionsList") or []
+                ]
 
                 branches: List[BranchAvailability] = []
                 for h in holdings:
@@ -689,6 +700,7 @@ class OmnisClient:
                         physical_description=self._display_first(v, "format"),
                         resource_type=self._display_first(v, "type"),
                         branches=branches,
+                        other_institutions=other_institutions,
                     )
                 )
 

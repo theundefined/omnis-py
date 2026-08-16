@@ -38,6 +38,10 @@ config_dump.json
 
 # tmp
 curls
+debug_search_output/
+covers.json
+check_covers.py
+debug_search_shapes.py
 
 # Internal working notes/plans — may contain account numbers or other
 # private data from live API verification; never intended to be committed

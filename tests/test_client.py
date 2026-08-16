@@ -166,7 +166,16 @@ async def test_search_books_groups_versions_and_resolves_due_dates():
         }
 
     delivery_response = [
-        {"pnx": version_new["pnx"], "delivery": {"holding": [holding("Filia 01", "F01", "H1", "available")]}},
+        {
+            "pnx": version_new["pnx"],
+            "delivery": {
+                "holding": [holding("Filia 01", "F01", "H1", "available")],
+                "almaInstitutionsList": [
+                    {"instCode": "48OMNIS_NLOP", "instName": "Biblioteka Narodowa", "instId": "5066", "envURL": ""},
+                    {"instCode": "48OMNIS_UJA", "instName": "Uniwersytet Jagielloński", "instId": "5067", "envURL": ""},
+                ],
+            },
+        },
         {
             "pnx": version_old["pnx"],
             "delivery": {"holding": [holding("BG - Wypożyczalnia", "WYPOZ", "H2", "unavailable")]},
@@ -220,12 +229,19 @@ async def test_search_books_groups_versions_and_resolves_due_dates():
     assert by_mmsid["TOP1"].branches[0].due_date is None
     assert by_mmsid["TOP1"].branches[0].sub_location == "Some address"
     assert by_mmsid["TOP1"].branches[0].maps_url == "https://maps.app.goo.gl/fake"
+    assert [(i.code, i.name) for i in by_mmsid["TOP1"].other_institutions] == [
+        ("48OMNIS_NLOP", "Biblioteka Narodowa"),
+        ("48OMNIS_UJA", "Uniwersytet Jagielloński"),
+    ]
 
     assert by_mmsid["OLD1"].edition == "Wydanie I."
     unavailable_branch = by_mmsid["OLD1"].branches[0]
     assert unavailable_branch.status == "unavailable"
     assert unavailable_branch.due_date == "20/03/2026"
     assert unavailable_branch.overdue is True
+    # No almaInstitutionsList key at all in this holding's delivery response -
+    # must default to an empty list, not raise.
+    assert by_mmsid["OLD1"].other_institutions == []
 
 
 @pytest.mark.asyncio
