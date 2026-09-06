@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -6,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import json
 import csv
 
+import click
 import yaml
 from datetime import datetime, date
 from rich.console import Console
@@ -853,108 +853,170 @@ def display_results_csv(results: List[Dict[str, Any]]):
             writer.writerow(row)
 
 
-async def async_main():
-    parser = argparse.ArgumentParser(description="OMNIS Library CLI Manager")
-    parser.add_argument("--add", action="store_true", help="Add a new account to configuration")
-    parser.add_argument(
-        "--format",
-        choices=["table", "json", "csv"],
-        default="table",
-        help="Output format (default: table)",
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--add", is_flag=True, help="Add a new account to configuration")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json", "csv"]),
+    default="table",
+    show_default=True,
+    help="Output format",
+)
+@click.option("--renew", is_flag=True, help="Attempt to renew all renewable loans for configured accounts")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Show more details: loan date and renewability (default), or genre/subject/ISBN/etc. per edition with --search",
+)
+@click.option("--history", is_flag=True, help="Show loan history instead of active loans")
+@click.option("--search", metavar="QUERY", help="Search the catalog by title/keyword")
+@click.option("--branch", metavar="NAME", help="Filter --search/--branches results to names containing this text")
+@click.option(
+    "--address",
+    is_flag=True,
+    help="Show branch street address (and maps link) in --search results",
+)
+@click.option(
+    "--branches",
+    is_flag=True,
+    help="Show the Biblioteka Raczyńskich branch directory (address, hours, phone, maps link)",
+)
+@click.option("--fines", is_flag=True, help="Show itemized fines for all configured accounts")
+@click.option(
+    "--requests",
+    "show_requests",
+    is_flag=True,
+    help="Show active holds/requests for all configured accounts "
+    "(holds are shown in a typed table; other categories are still raw — see docs/plans/account-actions-api.md)",
+)
+@click.option(
+    "--cancel-hold",
+    metavar="REQUEST_ID",
+    help="Cancel a hold by its request ID (as shown in --requests output)",
+)
+@click.option(
+    "--list-accounts",
+    is_flag=True,
+    help="List all configured accounts with index, enabled status, and timeout",
+)
+@click.option("--enable", type=int, metavar="INDEX", help="Enable account by index (see --list-accounts)")
+@click.option("--disable", type=int, metavar="INDEX", help="Disable account by index (see --list-accounts)")
+@click.option(
+    "--set-timeout",
+    nargs=2,
+    metavar="INDEX SECONDS",
+    help="Set per-account HTTP timeout in seconds by index (see --list-accounts)",
+)
+@click.option(
+    "--demo",
+    is_flag=True,
+    help="Switch to demo mode: disable all non-demo accounts and enable/create the omnis-mock demo account",
+)
+@click.option(
+    "--exit-demo",
+    is_flag=True,
+    help="Exit demo mode: disable the demo account and re-enable accounts that --demo had disabled",
+)
+def cli(
+    add: bool,
+    output_format: str,
+    renew: bool,
+    verbose: bool,
+    history: bool,
+    search: Optional[str],
+    branch: Optional[str],
+    address: bool,
+    branches: bool,
+    fines: bool,
+    show_requests: bool,
+    cancel_hold: Optional[str],
+    list_accounts: bool,
+    enable: Optional[int],
+    disable: Optional[int],
+    set_timeout: Optional[tuple],
+    demo: bool,
+    exit_demo: bool,
+):
+    """OMNIS Library CLI Manager"""
+    asyncio.run(
+        async_main(
+            add=add,
+            output_format=output_format,
+            renew=renew,
+            verbose=verbose,
+            history=history,
+            search=search,
+            branch=branch,
+            address=address,
+            branches=branches,
+            fines=fines,
+            show_requests=show_requests,
+            cancel_hold=cancel_hold,
+            list_accounts=list_accounts,
+            enable=enable,
+            disable=disable,
+            set_timeout=set_timeout,
+            demo=demo,
+            exit_demo=exit_demo,
+        )
     )
-    parser.add_argument(
-        "--renew", action="store_true", help="Attempt to renew all renewable loans for configured accounts"
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Show more details: loan date and renewability (default), or genre/subject/ISBN/etc. per edition with --search",
-    )
-    parser.add_argument("--history", action="store_true", help="Show loan history instead of active loans")
-    parser.add_argument("--search", metavar="QUERY", help="Search the catalog by title/keyword")
-    parser.add_argument(
-        "--branch", metavar="NAME", help="Filter --search/--branches results to names containing this text"
-    )
-    parser.add_argument(
-        "--address",
-        action="store_true",
-        help="Show branch street address (and maps link) in --search results",
-    )
-    parser.add_argument(
-        "--branches",
-        action="store_true",
-        help="Show the Biblioteka Raczyńskich branch directory (address, hours, phone, maps link)",
-    )
-    parser.add_argument("--fines", action="store_true", help="Show itemized fines for all configured accounts")
-    parser.add_argument(
-        "--requests",
-        action="store_true",
-        help="Show active holds/requests for all configured accounts "
-        "(holds are shown in a typed table; other categories are still raw — see docs/plans/account-actions-api.md)",
-    )
-    parser.add_argument(
-        "--cancel-hold",
-        metavar="REQUEST_ID",
-        help="Cancel a hold by its request ID (as shown in --requests output)",
-    )
-    parser.add_argument(
-        "--list-accounts",
-        action="store_true",
-        help="List all configured accounts with index, enabled status, and timeout",
-    )
-    parser.add_argument("--enable", type=int, metavar="INDEX", help="Enable account by index (see --list-accounts)")
-    parser.add_argument("--disable", type=int, metavar="INDEX", help="Disable account by index (see --list-accounts)")
-    parser.add_argument(
-        "--set-timeout",
-        nargs=2,
-        metavar=("INDEX", "SECONDS"),
-        help="Set per-account HTTP timeout in seconds by index (see --list-accounts)",
-    )
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Switch to demo mode: disable all non-demo accounts and enable/create the omnis-mock demo account",
-    )
-    parser.add_argument(
-        "--exit-demo",
-        action="store_true",
-        help="Exit demo mode: disable the demo account and re-enable accounts that --demo had disabled",
-    )
-    args = parser.parse_args()
 
-    if args.branches:
-        await run_branches(args.branch)
+
+async def async_main(
+    *,
+    add: bool,
+    output_format: str,
+    renew: bool,
+    verbose: bool,
+    history: bool,
+    search: Optional[str],
+    branch: Optional[str],
+    address: bool,
+    branches: bool,
+    fines: bool,
+    show_requests: bool,
+    cancel_hold: Optional[str],
+    list_accounts: bool,
+    enable: Optional[int],
+    disable: Optional[int],
+    set_timeout: Optional[tuple],
+    demo: bool,
+    exit_demo: bool,
+):
+    if branches:
+        await run_branches(branch)
         return
 
     accounts = load_config()
 
-    if args.list_accounts:
+    if list_accounts:
         display_accounts_table(accounts)
         return
 
-    if args.enable is not None:
+    if enable is not None:
         try:
-            _set_account_enabled(accounts, args.enable, True)
+            _set_account_enabled(accounts, enable, True)
         except IndexError:
-            rprint(f"[red]No account at index {args.enable}. Use --list-accounts to see valid indices.[/red]")
+            rprint(f"[red]No account at index {enable}. Use --list-accounts to see valid indices.[/red]")
             return
         save_config(accounts)
         return
 
-    if args.disable is not None:
+    if disable is not None:
         try:
-            _set_account_enabled(accounts, args.disable, False)
+            _set_account_enabled(accounts, disable, False)
         except IndexError:
-            rprint(f"[red]No account at index {args.disable}. Use --list-accounts to see valid indices.[/red]")
+            rprint(f"[red]No account at index {disable}. Use --list-accounts to see valid indices.[/red]")
             return
         save_config(accounts)
         return
 
-    if args.set_timeout is not None:
+    if set_timeout is not None:
         try:
-            idx = int(args.set_timeout[0])
-            seconds = float(args.set_timeout[1])
+            idx = int(set_timeout[0])
+            seconds = float(set_timeout[1])
             if seconds <= 0:
                 raise ValueError("timeout must be positive")
             _set_account_timeout(accounts, idx, seconds)
@@ -964,7 +1026,7 @@ async def async_main():
         save_config(accounts)
         return
 
-    if args.demo:
+    if demo:
         accounts = _apply_demo_mode(accounts)
         save_config(accounts)
         rprint("[bold green]Demo mode enabled.[/bold green] Using omnis-mock (https://omnis-mock.onrender.com).")
@@ -974,7 +1036,7 @@ async def async_main():
         )
         return
 
-    if args.exit_demo:
+    if exit_demo:
         accounts = _exit_demo_mode(accounts)
         save_config(accounts)
         rprint("[bold green]Demo mode disabled.[/bold green] Restored previously enabled accounts.")
@@ -982,7 +1044,7 @@ async def async_main():
 
     active_accounts = _enabled_accounts(accounts)
 
-    if args.fines:
+    if fines:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
@@ -992,10 +1054,10 @@ async def async_main():
                 "enable one, or --demo for the demo account.[/yellow]"
             )
             return
-        await run_fines(active_accounts, args.format)
+        await run_fines(active_accounts, output_format)
         return
 
-    if args.requests:
+    if show_requests:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
@@ -1005,10 +1067,10 @@ async def async_main():
                 "enable one, or --demo for the demo account.[/yellow]"
             )
             return
-        await run_requests(active_accounts, args.format)
+        await run_requests(active_accounts, output_format)
         return
 
-    if args.cancel_hold:
+    if cancel_hold:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
@@ -1018,10 +1080,10 @@ async def async_main():
                 "enable one, or --demo for the demo account.[/yellow]"
             )
             return
-        await run_cancel_hold(active_accounts, args.cancel_hold)
+        await run_cancel_hold(active_accounts, cancel_hold)
         return
 
-    if args.search:
+    if search:
         if not accounts:
             rprint("[red]No accounts configured. Add one first with --add.[/red]")
             return
@@ -1031,10 +1093,10 @@ async def async_main():
                 "enable one, or --demo for the demo account.[/yellow]"
             )
             return
-        await run_search(active_accounts[0], args.search, args.branch, args.address, args.verbose)
+        await run_search(active_accounts[0], search, branch, address, verbose)
         return
 
-    if args.add or not accounts:
+    if add or not accounts:
         if not accounts:
             console.print("[yellow]No configuration found. Let's add your first account![/yellow]")
 
@@ -1062,13 +1124,16 @@ async def async_main():
         return
 
     # If requested, attempt to renew loans before fetching data so updated due dates are shown
-    if args.renew and not args.history:
+    if renew and not history:
         rprint("\n[bold green]Attempting to renew renewable loans for all accounts...[/bold green]")
         for account in active_accounts:
             client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
             try:
                 await client.login(
-                    account["username"], account["password"], account.get("institution"), account.get("view")
+                    account["username"],
+                    account["password"],
+                    account.get("institution", "48OMNIS_BRP"),
+                    account.get("view", "48OMNIS_BRP:BRACZ"),
                 )
             except Exception as e:
                 console.print(f"[red]Login failed for {account.get('username')}: {e}[/red]")
@@ -1107,25 +1172,25 @@ async def async_main():
         rprint("\n[bold green]Renewal attempts finished. Fetching updated data...[/bold green]")
 
     # Details are needed for json and csv formats
-    fetch_details = args.format in ["json", "csv"]
+    fetch_details = output_format in ["json", "csv"]
 
     with console.status(
-        f"[bold green]Fetching library {'history' if args.history else 'data'}...[/bold green]", spinner="dots"
+        f"[bold green]Fetching library {'history' if history else 'data'}...[/bold green]", spinner="dots"
     ):
-        tasks = [fetch_account_data(acc, fetch_details, args.history) for acc in active_accounts]
+        tasks = [fetch_account_data(acc, fetch_details, history) for acc in active_accounts]
         results = await asyncio.gather(*tasks)
 
-    if args.format == "table":
-        display_results_table(results, details=fetch_details, history=args.history, verbose=args.verbose)
-    elif args.format == "json":
+    if output_format == "table":
+        display_results_table(results, details=fetch_details, history=history, verbose=verbose)
+    elif output_format == "json":
         display_results_json(results)
-    elif args.format == "csv":
+    elif output_format == "csv":
         display_results_csv(results)
 
 
 def main():
     try:
-        asyncio.run(async_main())
+        cli()
     except KeyboardInterrupt:
         console.print("\n[red]Cancelled by user[/red]")
         sys.exit(0)
