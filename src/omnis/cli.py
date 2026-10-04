@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import csv
 
@@ -16,7 +16,17 @@ from rich import print as rprint
 
 import httpx
 
-from omnis.client import OmnisClient, UserInfo, Loan, BookDetails, SearchResult, Fine, RequestItem
+from omnis.client import (
+    OmnisClient,
+    UserInfo,
+    Loan,
+    BookDetails,
+    SearchResult,
+    Fine,
+    RequestItem,
+    HoldableItem,
+    PickupLocation,
+)
 from omnis.tenants import KNOWN_TENANTS, MOCK_TENANT
 from omnis.branches import fetch_branches, BranchInfo
 
@@ -29,6 +39,9 @@ DEMO_USERNAME = "demo"
 DEMO_PASSWORD = "demo1234"
 
 console = Console()
+
+# Seconds to wait before each re-check of myaccount/requests after --place-hold.
+HOLD_CONFIRM_DELAYS = (1.0, 2.0, 3.0, 5.0)
 
 
 def parse_date(date_str: str) -> Optional[date]:
@@ -446,16 +459,18 @@ def display_search_results(
             if version.resource_type and version.resource_type.lower() != "book":
                 edition_label = f"{edition_label} [{version.resource_type}]"
             year = version.publication_date or "-"
+            # MMS ID shown once per edition: it's what --place-hold takes.
+            edition_label_with_id = f"{edition_label}\nMMS {version.mmsid}"
 
             if not version.branches:
-                row = [edition_label, year, "[dim]no data[/dim]"]
+                row = [edition_label_with_id, year, "[dim]no data[/dim]"]
                 if show_address:
                     row.append("")
                 row.append("")
                 table.add_row(*row)
                 continue
 
-            for branch in version.branches:
+            for i, branch in enumerate(version.branches):
                 if branch.status == "available":
                     status_display = "[green]Available[/green]"
                 elif branch.due_date:
@@ -466,7 +481,7 @@ def display_search_results(
                 else:
                     status_display = "[yellow]Borrowed[/yellow]"
 
-                row = [edition_label, year, branch.library_name]
+                row = [edition_label_with_id if i == 0 else edition_label, year, branch.library_name]
                 if show_address:
                     address_display = branch.sub_location or "-"
                     if branch.maps_url:
@@ -668,6 +683,141 @@ async def run_cancel_hold(accounts: List[Dict[str, Any]], request_id: str):
     console.print(f"[red]No active hold with request ID '{request_id}' found on any configured account.[/red]")
 
 
+def _select_account(
+    accounts: List[Dict[str, Any]], index: Optional[int]
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Pick the account a single-account action (e.g. --place-hold) runs as.
+
+    Returns `(account, None)` or `(None, error_message)`. Never guesses between several
+    enabled accounts — unlike --cancel-hold, the right one can't be inferred."""
+    if index is not None:
+        if not 1 <= index <= len(accounts):
+            return None, f"No account at index {index}. Use --list-accounts to see valid indices."
+        account = accounts[index - 1]
+        if account.get("enabled", True) is False:
+            return None, f"Account {index} is disabled. Enable it first with --enable {index}."
+        return account, None
+    active = _enabled_accounts(accounts)
+    if len(active) == 1:
+        return active[0], None
+    if not active:
+        return None, "No enabled accounts. Use --list-accounts to see accounts and --enable INDEX to enable one."
+    return None, "Several accounts are enabled — choose one with --account INDEX (see --list-accounts)."
+
+
+def _pick_holdable_item(items: List[HoldableItem]) -> HoldableItem:
+    # Any copy at a branch can be requested; prefer one that's on the shelf so the hold
+    # is fulfilled from stock rather than queued behind a loan.
+    on_shelf = [i for i in items if i.status_name and "na półce" in i.status_name.lower()]
+    return (on_shelf or items)[0]
+
+
+def _pick_pickup(pickups: List[PickupLocation], pickup_filter: Optional[str]) -> Optional[PickupLocation]:
+    if pickup_filter:
+        matches = [p for p in pickups if pickup_filter.lower() in p.name.lower()]
+    else:
+        matches = pickups
+    return matches[0] if len(matches) == 1 else None
+
+
+async def run_place_hold(
+    account: Dict[str, Any],
+    mmsid: str,
+    branch_filter: Optional[str],
+    pickup_filter: Optional[str],
+    assume_yes: bool,
+):
+    label = f"{account.get('tenant_name', 'Unknown')} ({account['username']})"
+    client = OmnisClient(account["base_url"], timeout=account.get("timeout", 30.0))
+    try:
+        await client.login(account["username"], account["password"], account["institution"], account["view"])
+
+        with console.status("[bold green]Looking up requestable copies...[/bold green]", spinner="dots"):
+            items = await client.get_holdable_items(mmsid, branch_filter)
+        if not items:
+            suffix = f" at a branch matching '{branch_filter}'" if branch_filter else ""
+            console.print(f"[red]No requestable copies of MMS {mmsid}{suffix}.[/red]")
+            return
+
+        branch_names = list(dict.fromkeys(i.main_location or "?" for i in items))
+        if len(branch_names) > 1:
+            console.print("[yellow]This record can be requested at several branches — pick one with --branch:[/yellow]")
+            for name in branch_names:
+                console.print(f"  • {name}")
+            return
+
+        item = _pick_holdable_item(items)
+        options = await client.get_hold_options(item)
+        if not options.pickup_locations:
+            console.print("[red]Primo offered no pickup location for this copy.[/red]")
+            return
+        pickup = _pick_pickup(options.pickup_locations, pickup_filter)
+        if not pickup:
+            console.print("[yellow]Choose a pickup location with --pickup:[/yellow]")
+            for p in options.pickup_locations:
+                console.print(f"  • {p.name}")
+            return
+
+        # Holds may be reported under the network-zone id, while --search shows local ids.
+        record_ids = {mmsid, item.mmsid, item.network_mmsid} - {None}
+        holds_before = [r.hold for r in await client.get_requests() if r.hold]
+        existing = [h for h in holds_before if h.mmsid in record_ids]
+        if existing:
+            console.print(
+                f"[yellow]Warning: this account already has a hold on this record "
+                f"(request ID {existing[0].request_id}, status: {existing[0].status}).[/yellow]"
+            )
+
+        console.print(
+            Panel(
+                "\n".join(
+                    [
+                        f"[bold]Title:[/bold] {item.title or '-'}",
+                        f"[bold]Branch:[/bold] {item.main_location or '-'} ({item.sub_location or '-'})",
+                        f"[bold]Copy status:[/bold] {item.status_name or '-'}",
+                        f"[bold]Pickup:[/bold] {pickup.name}",
+                        f"[bold]Account:[/bold] {label}",
+                    ]
+                ),
+                title="📥 Place hold",
+                title_align="left",
+            )
+        )
+        if not assume_yes and not Confirm.ask("Place this hold?"):
+            console.print("[dim]Not placed.[/dim]")
+            return
+
+        res = await client.place_hold(options, pickup)
+        # Primo's success body is just {"status": "ok", ...} with no request ID, and the new
+        # hold shows up in myaccount/requests only after a few seconds (observed live:
+        # an immediate re-fetch still listed the old holds). Poll briefly to confirm it.
+        ids_before = {h.request_id for h in holds_before}
+        new_holds = []
+        for delay in HOLD_CONFIRM_DELAYS:
+            await asyncio.sleep(delay)
+            new_holds = [r.hold for r in await client.get_requests() if r.hold and r.hold.request_id not in ids_before]
+            if new_holds:
+                break
+        if new_holds:
+            new_hold = new_holds[0]
+            console.print(f"[green]Hold placed[/green] — request ID {new_hold.request_id}, status: {new_hold.status}")
+        else:
+            console.print(
+                "[yellow]Primo accepted the request, but the hold hasn't shown up in --requests yet — "
+                f"check again in a moment. Response: {res}[/yellow]"
+            )
+        try:
+            queue = await client.get_item_queue(item.item_id)
+            if queue:
+                console.print(f"Queue: {queue}")
+        except httpx.HTTPError:
+            pass
+    except Exception as e:
+        console.print(f"[red]Could not place hold for {label}: {e}[/red]")
+    finally:
+        await client.close()
+
+
 def display_requests_table(results: List[Dict[str, Any]]):
     # `hold` items get a typed table (shape verified live, see
     # docs/plans/account-actions-api.md). Other categories (photocopy/booking/cdl/ill/acq)
@@ -694,6 +844,7 @@ def display_requests_table(results: List[Dict[str, Any]]):
                 show_header=True,
                 header_style="bold",
             )
+            table.add_column("Request ID", style="dim")
             table.add_column("Title", style="magenta")
             table.add_column("Status")
             table.add_column("Ready for pickup")
@@ -709,6 +860,7 @@ def display_requests_table(results: List[Dict[str, Any]]):
                     requested_date.strftime("%d/%m/%Y") if requested_date else (hold.request_date or "-")
                 )
                 table.add_row(
+                    hold.request_id,
                     hold.title,
                     hold.status,
                     available_display,
@@ -897,6 +1049,21 @@ def display_results_csv(results: List[Dict[str, Any]]):
     help="Cancel a hold by its request ID (as shown in --requests output)",
 )
 @click.option(
+    "--place-hold",
+    metavar="MMSID",
+    help="Place a hold (zamówienie) on a record by MMS ID (as shown in --search output); "
+    "narrow with --branch, choose with --account/--pickup",
+)
+@click.option(
+    "--account",
+    "account_index",
+    type=int,
+    metavar="INDEX",
+    help="Account to use for --place-hold, by index (see --list-accounts); required if several are enabled",
+)
+@click.option("--pickup", metavar="NAME", help="Pickup location for --place-hold, when more than one is offered")
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Don't ask for confirmation before --place-hold")
+@click.option(
     "--list-accounts",
     is_flag=True,
     help="List all configured accounts with index, enabled status, and timeout",
@@ -932,6 +1099,10 @@ def cli(
     fines: bool,
     show_requests: bool,
     cancel_hold: Optional[str],
+    place_hold: Optional[str],
+    account_index: Optional[int],
+    pickup: Optional[str],
+    assume_yes: bool,
     list_accounts: bool,
     enable: Optional[int],
     disable: Optional[int],
@@ -954,6 +1125,10 @@ def cli(
             fines=fines,
             show_requests=show_requests,
             cancel_hold=cancel_hold,
+            place_hold=place_hold,
+            account_index=account_index,
+            pickup=pickup,
+            assume_yes=assume_yes,
             list_accounts=list_accounts,
             enable=enable,
             disable=disable,
@@ -978,6 +1153,10 @@ async def async_main(
     fines: bool,
     show_requests: bool,
     cancel_hold: Optional[str],
+    place_hold: Optional[str],
+    account_index: Optional[int],
+    pickup: Optional[str],
+    assume_yes: bool,
     list_accounts: bool,
     enable: Optional[int],
     disable: Optional[int],
@@ -1081,6 +1260,19 @@ async def async_main(
             )
             return
         await run_cancel_hold(active_accounts, cancel_hold)
+        return
+
+    if place_hold:
+        if not accounts:
+            rprint("[red]No accounts configured. Add one first with --add.[/red]")
+            return
+        account, error = _select_account(accounts, account_index)
+        if account is None:
+            rprint(f"[yellow]{error}[/yellow]")
+            if account_index is None and len(active_accounts) > 1:
+                display_accounts_table(accounts)
+            return
+        await run_place_hold(account, place_hold, branch, pickup, assume_yes)
         return
 
     if search:

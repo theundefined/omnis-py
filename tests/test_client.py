@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 import respx
-from omnis.client import OmnisClient
+from omnis.client import HoldableItem, HoldRequestOptions, OmnisClient, PickupLocation
 
 
 def test_client_default_timeout_is_30():
@@ -491,6 +491,16 @@ async def test_get_requests_requires_login():
         await client.get_requests()
 
 
+# Verified live 2026-10-04.
+CANCEL_OK = {
+    "beaconO22": "646",
+    "status": "ok",
+    "reply-code": "0000",
+    "reply-text": "OK",
+    "data": {"holds": {"hold": [{"requestid": "45519739360009337", "note": {"type": "info"}}]}},
+}
+
+
 @pytest.mark.asyncio
 async def test_cancel_hold_sends_verified_payload():
     # Endpoint/payload captured live from the browser's own cancel action (curls/anulowanie):
@@ -500,14 +510,14 @@ async def test_cancel_hold_sends_verified_payload():
     with respx.mock:
         route = respx.post(
             "https://omnis-br.primo.exlibrisgroup.com/primaws/rest/priv/myaccount/cancel_requests"
-        ).respond(200, json={"success": True})
+        ).respond(200, json=CANCEL_OK)
 
         result = await client.cancel_hold("45519739360009337")
 
     assert route.called
     sent_request = route.calls.last.request
     assert json.loads(sent_request.content) == {"request_id": "45519739360009337", "request_type": "holds"}
-    assert result == {"success": True}
+    assert result == CANCEL_OK
 
 
 @pytest.mark.asyncio
@@ -515,3 +525,273 @@ async def test_cancel_hold_requires_login():
     client = OmnisClient()
     with pytest.raises(ValueError):
         await client.cancel_hold("45519739360009337")
+
+
+# --- placing holds (shape from curls/zamowienie; all ids/titles below are invented) ---
+
+BASE = "https://omnis-br.primo.exlibrisgroup.com"
+LOCAL_MMS = "991000000000009337"
+NZ_MMS = "991000000000005606"
+ITEM_ID = "23800000000009337"
+SERVICE_ID = "46000000000009337"
+REQUEST_PATH = (
+    f"/primaws/rest/priv/ILSServices/itemServices/{LOCAL_MMS}/item/{ITEM_ID}/{SERVICE_ID}/AlmaItemRequest"
+    "?institution=48OMNIS_BRP&hasHold=true&hasBooking=false"
+)
+
+
+def _holding(branch, library_id):
+    return {
+        "mainLocation": branch,
+        "subLocation": "ul. Przykładowa 1",
+        "availabilityStatus": "available",
+        "holdId": f"228{library_id}",
+        "holKey": f"HoldingResultKey [mid=228{library_id}, libraryId={library_id}, locationCode=X, callNumber=null]",
+    }
+
+
+def _holdings_response(branch, allowed="Y"):
+    return {
+        "data": {
+            "itemInfo": {
+                "locations": [
+                    {
+                        "main-location": branch,
+                        "sub-location": "ul. Przykładowa 1",
+                        "items": [
+                            {
+                                "itemid": ITEM_ID,
+                                "mmsid": LOCAL_MMS,
+                                "itemstatusname": "Egzemplarz na półce",
+                                "itemcategoryname": "30 Days Loan",
+                                "itempolicy": "Wypożyczane na 30 dni",
+                                "itemmaterial": "Książka",
+                                "mainlocationname": branch,
+                                "secondarylocationname": "ul. Przykładowa 1",
+                                "listofservices": {
+                                    "service": [
+                                        {
+                                            "type": "AlmaItemRequest",
+                                            "allowed": allowed,
+                                            "link-to-service": REQUEST_PATH,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+
+def _mock_record_lookup(search_recordid, holdings):
+    control = {"recordid": [search_recordid], "originalsourceid": [NZ_MMS]}
+    respx.get(f"{BASE}/primaws/rest/pub/pnxs").respond(
+        200, json={"docs": [{"pnx": {"control": control, "display": {"title": ["Książka"]}}}]}
+    )
+    respx.post(f"{BASE}/primaws/rest/pub/delivery").respond(
+        200, json=[{"pnx": {"control": {"recordid": [search_recordid]}}, "delivery": {"holding": holdings}}]
+    )
+    respx.get(f"{BASE}/primaws/rest/pub/getPhysicalService/{search_recordid.removeprefix('alma')}").respond(
+        200, json={"physicalServiceId": SERVICE_ID}
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_holdable_items_resolves_network_zone_id_to_local_record():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    client.institution = "48OMNIS_BRP"
+    client.view = "48OMNIS_BRP:BRACZ"
+    with respx.mock:
+        # Searching by a network-zone id returns the *local* record, with a different id.
+        _mock_record_lookup(f"alma{LOCAL_MMS}", [_holding("Filia 1", "111")])
+        holdings_route = respx.post(f"{BASE}/primaws/rest/priv/ILSServices/holdings/{SERVICE_ID}").respond(
+            200, json=_holdings_response("Filia 1")
+        )
+
+        items = await client.get_holdable_items(NZ_MMS)
+
+    assert len(items) == 1
+    assert items[0].mmsid == LOCAL_MMS
+    assert items[0].network_mmsid == NZ_MMS
+    assert items[0].item_id == ITEM_ID
+    assert items[0].request_path == REQUEST_PATH
+    assert items[0].main_location == "Filia 1"
+    body = json.loads(holdings_route.calls.last.request.content)
+    assert body["filters"]["ilsRecordList"] == [{"institution": "48OMNIS_BRP", "recordId": LOCAL_MMS}]
+    assert len(body["locations"]) == 1 and body["locations"][0]["holKey"]
+
+
+@pytest.mark.asyncio
+async def test_get_holdable_items_skips_items_without_allowed_request_service():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        _mock_record_lookup(f"alma{LOCAL_MMS}", [_holding("Filia 1", "111")])
+        respx.post(f"{BASE}/primaws/rest/priv/ILSServices/holdings/{SERVICE_ID}").respond(
+            200, json=_holdings_response("Filia 1", allowed="N")
+        )
+
+        items = await client.get_holdable_items(LOCAL_MMS)
+
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_get_holdable_items_branch_filter_limits_holdings_calls():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        _mock_record_lookup(f"alma{LOCAL_MMS}", [_holding("Filia 1", "111"), _holding("Filia 2", "222")])
+        holdings_route = respx.post(f"{BASE}/primaws/rest/priv/ILSServices/holdings/{SERVICE_ID}").respond(
+            200, json=_holdings_response("Filia 2")
+        )
+
+        items = await client.get_holdable_items(LOCAL_MMS, branch_filter="filia 2")
+
+    assert holdings_route.call_count == 1
+    assert json.loads(holdings_route.calls.last.request.content)["locations"][0]["mainLocation"] == "Filia 2"
+    assert [i.main_location for i in items] == ["Filia 2"]
+
+
+def _holdable_item():
+    return HoldableItem(
+        mmsid=LOCAL_MMS,
+        item_id=ITEM_ID,
+        request_path=REQUEST_PATH,
+        status_name="Egzemplarz na półce",
+        category="30 Days Loan",
+        main_location="Filia 1",
+        sub_location="ul. Przykładowa 1",
+    )
+
+
+def _form(pickups):
+    return {
+        "services-arr": {
+            "services": [
+                {
+                    "itemId": ITEM_ID,
+                    "groups-list-map": [
+                        {
+                            "pickupLocation": pickups,
+                            "materialType": {"key": "BOOK", "value": "Książka"},
+                            "requestType": "hold",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_hold_options_parses_pickup_keys():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    client.view = "48OMNIS_BRP:BRACZ"
+    with respx.mock:
+        route = respx.get(f"{BASE}{REQUEST_PATH.split('?')[0]}").respond(
+            200,
+            json=_form(
+                [
+                    {"key": "111$$LIBRARY", "value": "Filia 1"},
+                    {"key": "222$$LIBRARY", "value": "Filia 2"},
+                ]
+            ),
+        )
+
+        options = await client.get_hold_options(_holdable_item())
+
+    params = route.calls.last.request.url.params
+    assert params["institution"] == "48OMNIS_BRP"
+    assert params["hasHold"] == "true"
+    assert params["itemid"] == ITEM_ID
+    assert options.request_type == "hold"
+    assert options.material_type == "BOOK"
+    assert [(p.id, p.type, p.name) for p in options.pickup_locations] == [
+        ("111", "LIBRARY", "Filia 1"),
+        ("222", "LIBRARY", "Filia 2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_hold_options_rejects_unexpected_pickup_key():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get(f"{BASE}{REQUEST_PATH.split('?')[0]}").respond(200, json=_form([{"key": "111", "value": "Filia 1"}]))
+        with pytest.raises(ValueError):
+            await client.get_hold_options(_holdable_item())
+
+
+@pytest.mark.asyncio
+async def test_place_hold_sends_captured_payload():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    pickup = PickupLocation(id="111", type="LIBRARY", name="Filia 1")
+    options = HoldRequestOptions(
+        item=_holdable_item(), request_type="hold", material_type="BOOK", pickup_locations=[pickup]
+    )
+    with respx.mock:
+        route = respx.post(f"{BASE}{REQUEST_PATH.split('?')[0]}").respond(
+            200, json={"beaconO22": "385", "reply-text": "ok", "status": "ok"}
+        )
+
+        result = await client.place_hold(options, pickup)
+
+    sent = route.calls.last.request
+    assert sent.url.params["institution"] == "48OMNIS_BRP"
+    assert sent.url.params["hasHold"] == "true"
+    assert json.loads(sent.content) == {
+        "requestType": "hold",
+        "pickupLocation": "111",
+        "materialType": "BOOK",
+        "itemId": ITEM_ID,
+        "group_id": LOCAL_MMS,
+        "pickupLibraryId": "111",
+        "pickupType": "LIBRARY",
+    }
+    assert result == {"beaconO22": "385", "reply-text": "ok", "status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_get_item_queue():
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    with respx.mock:
+        respx.get(f"{BASE}/primaws/rest/priv/ILSServices/itemQueue/{ITEM_ID}").respond(
+            200, json={"itemId": ITEM_ID, "itemQueueString": "(zamówienie: 1)"}
+        )
+        assert await client.get_item_queue(ITEM_ID) == "(zamówienie: 1)"
+
+
+@pytest.mark.asyncio
+async def test_place_hold_requires_login():
+    client = OmnisClient()
+    pickup = PickupLocation(id="111", type="LIBRARY", name="Filia 1")
+    options = HoldRequestOptions(
+        item=_holdable_item(), request_type="hold", material_type="BOOK", pickup_locations=[pickup]
+    )
+    with pytest.raises(ValueError):
+        await client.place_hold(options, pickup)
+
+
+@pytest.mark.asyncio
+async def test_place_hold_raises_on_primo_failure_envelope():
+    # Primo reports some failures as HTTP 200 + {"status": "failed", "reply-code": ...}.
+    client = OmnisClient()
+    client.token = "fake.token.fake"
+    pickup = PickupLocation(id="111", type="LIBRARY", name="Filia 1")
+    options = HoldRequestOptions(
+        item=_holdable_item(), request_type="hold", material_type="BOOK", pickup_locations=[pickup]
+    )
+    with respx.mock:
+        respx.post(f"{BASE}{REQUEST_PATH.split('?')[0]}").respond(
+            200, json={"status": "failed", "reply-code": "0002", "reply-text": "Request failed"}
+        )
+        with pytest.raises(ValueError, match="Request failed"):
+            await client.place_hold(options, pickup)

@@ -169,6 +169,68 @@ class SearchResult(BaseModel):
     versions: List[BookVersion] = []
 
 
+class HoldableItem(BaseModel):
+    """A single physical copy that Primo offers an `AlmaItemRequest` (hold) service for,
+    taken from the item list of `ILSServices/holdings` (shape verified live, see
+    `curls/zamowienie`). `request_path` is Primo's own `link-to-service` for that item —
+    it embeds a `physicalServiceId` that is session-scoped, so items must not be cached
+    across logins."""
+
+    mmsid: str
+    item_id: str
+    request_path: str
+    # Network-zone MMS id of the same record (`pnx.control.originalsourceid`) — the id
+    # `myaccount/requests` reports holds under, so needed to match existing holds.
+    network_mmsid: Optional[str] = None
+    title: Optional[str] = None
+    barcode: Optional[str] = None
+    status_name: Optional[str] = None
+    category: Optional[str] = None
+    policy: Optional[str] = None
+    material: Optional[str] = None
+    call_number: Optional[str] = None
+    main_location: Optional[str] = None
+    sub_location: Optional[str] = None
+
+
+class PickupLocation(BaseModel):
+    """One pickup option from the hold request form. Primo encodes it as a single
+    `"<libraryId>$$<TYPE>"` key (e.g. `"42713777720009337$$LIBRARY"`); the submit
+    body needs the two halves separately."""
+
+    id: str
+    type: str
+    name: str
+
+    @classmethod
+    def from_key(cls, key: str, name: str) -> "PickupLocation":
+        parts = key.split("$$")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(f"Unexpected pickup location key format: {key!r}")
+        return cls(id=parts[0], type=parts[1], name=name)
+
+
+class HoldRequestOptions(BaseModel):
+    """The hold request form for one item (`GET .../AlmaItemRequest`)."""
+
+    item: HoldableItem
+    request_type: str
+    material_type: str
+    pickup_locations: List[PickupLocation]
+
+
+def _raise_for_primo_failure(data: Any) -> None:
+    """Primo reports some failures as HTTP 200 with an envelope like
+    `{"status": "failed", "reply-code": "0002", "reply-text": "..."}` (successful
+    envelopes carry `"status": "ok"`, `"reply-code": "0000"`). Responses without
+    those keys are left alone — not every endpoint wraps its body this way."""
+    if not isinstance(data, dict):
+        return
+    reply_code = data.get("reply-code")
+    if data.get("status") == "failed" or (reply_code is not None and reply_code != "0000"):
+        raise ValueError(f"Primo rejected the request: {data.get('reply-text') or data}")
+
+
 class OmnisClient:
     def __init__(
         self,
@@ -426,7 +488,9 @@ class OmnisClient:
     async def cancel_hold(self, request_id: str) -> Dict[str, Any]:
         """Cancel a hold. Endpoint/payload shape captured live from the browser's own
         cancel action (see curls/anulowanie) rather than guessed from convention:
-        `request_type` is "holds" (the plural category key), not "hold"."""
+        `request_type` is "holds" (the plural category key), not "hold". Success response
+        (verified live): `{"status": "ok", "reply-code": "0000", "reply-text": "OK",
+        "data": {"holds": {"hold": [{"requestid": ..., "note": {"type": "info"}}]}}}`."""
         if not self.token:
             raise ValueError("Not logged in")
 
@@ -437,7 +501,9 @@ class OmnisClient:
 
         response = await self.client.post(cancel_url, params=params, headers=headers, json=data)
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+        _raise_for_primo_failure(result)
+        return result
 
     def _build_search_params(
         self, q: str, qInclude: str = "", sort: str = "rank", limit: int = 10, came_from: Optional[str] = None
@@ -541,10 +607,11 @@ class OmnisClient:
         except httpx.HTTPError:
             return None
 
-    async def _get_due_date_for_holding(
+    async def _post_holdings(
         self, bare_mmsid: str, holding: Dict[str, Any], physical_service_id: str
-    ) -> Optional[Tuple[Optional[str], bool]]:
-        """Fetch item-level status for a single branch holding to extract its due date, if any."""
+    ) -> Dict[str, Any]:
+        """Fetch item-level detail for a single branch holding. `locations` must contain
+        only that one holding (with its `holKey`) — see CLAUDE.md."""
         main_location = holding.get("mainLocation", "")
         body = {
             "filters": {
@@ -564,15 +631,21 @@ class OmnisClient:
         headers = {"Content-Type": "application/json;charset=UTF-8"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        response = await self.client.post(
+            f"{self.base_url}/primaws/rest/priv/ILSServices/holdings/{physical_service_id}",
+            params={"record-institution": self.institution, "lang": "pl"},
+            headers=headers,
+            json=body,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def _get_due_date_for_holding(
+        self, bare_mmsid: str, holding: Dict[str, Any], physical_service_id: str
+    ) -> Optional[Tuple[Optional[str], bool]]:
+        """Fetch item-level status for a single branch holding to extract its due date, if any."""
         try:
-            response = await self.client.post(
-                f"{self.base_url}/primaws/rest/priv/ILSServices/holdings/{physical_service_id}",
-                params={"record-institution": self.institution, "lang": "pl"},
-                headers=headers,
-                json=body,
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = await self._post_holdings(bare_mmsid, holding, physical_service_id)
         except httpx.HTTPError:
             return None
 
@@ -727,6 +800,191 @@ class OmnisClient:
             await asyncio.gather(*(enrich(b, m, h) for b, m, h in enrich_targets))
 
         return results
+
+    async def _resolve_record_holdings(self, mmsid: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Find the local catalog record for `mmsid` and its per-branch `delivery` holdings.
+
+        Searching by the id itself works for both local (`...9337`) and network-zone
+        (`...5606`, as `myaccount/requests` reports them) MMS ids — but a network-zone id
+        resolves to a *different* local record id, so callers must continue with the
+        returned doc's id, not the one passed in. `delivery` is called with the very same
+        search params, per the batching gotcha documented in CLAUDE.md.
+        """
+        mmsid = mmsid.removeprefix("alma")
+        params = self._build_search_params(mmsid, limit=10)
+        docs = (await self._pnxs_search(params)).get("docs", [])
+        exact = [d for d in docs if self._bare_mmsid(d) == mmsid]
+        if exact:
+            doc = exact[0]
+        elif len(docs) == 1:
+            doc = docs[0]
+        elif not docs:
+            raise ValueError(f"No catalog record found for MMS ID {mmsid}")
+        else:
+            raise ValueError(f"MMS ID {mmsid} matched {len(docs)} records; use the local id from --search")
+
+        alma_id = self._alma_id(doc)
+        holdings: List[Dict[str, Any]] = []
+        if alma_id:
+            for item in await self._pnxs_delivery(params, [alma_id]):
+                if self._alma_id(item) == alma_id:
+                    holdings = (item.get("delivery") or {}).get("holding") or []
+        return doc, holdings
+
+    async def get_holdable_items(self, mmsid: str, branch_filter: Optional[str] = None) -> List[HoldableItem]:
+        """List physical copies of a record that can be requested (held), across branches.
+
+        `branch_filter` is a case-insensitive substring match on the branch name, like
+        `search_books`'s. Only items whose `AlmaItemRequest` service is `allowed: "Y"`
+        are returned."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        doc, holdings = await self._resolve_record_holdings(mmsid)
+        bare_mmsid = self._bare_mmsid(doc)
+        title = self._display_first(doc, "title")
+        original_ids = doc.get("pnx", {}).get("control", {}).get("originalsourceid") or []
+        network_mmsid = original_ids[0] if original_ids else None
+        branch_filter_lower = branch_filter.lower() if branch_filter else None
+        holdings = [
+            h for h in holdings if not branch_filter_lower or branch_filter_lower in h.get("mainLocation", "").lower()
+        ]
+        if not holdings:
+            return []
+
+        # physicalServiceId is session-scoped (observed to change between logins), so it
+        # is always fetched fresh rather than cached.
+        service_id = await self._get_physical_service_id(bare_mmsid)
+        if not service_id:
+            raise ValueError(f"No physical service available for MMS ID {bare_mmsid}")
+
+        responses = await asyncio.gather(*(self._post_holdings(bare_mmsid, h, service_id) for h in holdings))
+
+        items: List[HoldableItem] = []
+        for data in responses:
+            for loc in data.get("data", {}).get("itemInfo", {}).get("locations", []):
+                for item in loc.get("items", []):
+                    services = item.get("listofservices", {}).get("service", []) or []
+                    request_service = next(
+                        (
+                            s
+                            for s in services
+                            if s.get("type") == "AlmaItemRequest"
+                            and s.get("allowed") == "Y"
+                            and s.get("link-to-service")
+                        ),
+                        None,
+                    )
+                    if not request_service or not item.get("itemid"):
+                        continue
+                    items.append(
+                        HoldableItem(
+                            mmsid=item.get("mmsid") or bare_mmsid,
+                            item_id=item["itemid"],
+                            request_path=request_service["link-to-service"],
+                            network_mmsid=network_mmsid,
+                            title=title,
+                            barcode=item.get("itembarcode"),
+                            status_name=item.get("itemstatusname"),
+                            category=item.get("itemcategoryname"),
+                            policy=item.get("itempolicy"),
+                            material=item.get("itemmaterial"),
+                            call_number=item.get("callnumber2"),
+                            main_location=item.get("mainlocationname") or loc.get("main-location"),
+                            sub_location=item.get("secondarylocationname") or loc.get("sub-location"),
+                        )
+                    )
+        return items
+
+    def _item_request_url(self, item: HoldableItem) -> Tuple[str, Dict[str, str]]:
+        # `request_path` is Primo's own link-to-service, already carrying
+        # institution/hasHold/hasBooking as query params; reuse it instead of rebuilding.
+        url = httpx.URL(f"{self.base_url}{item.request_path}")
+        params = dict(url.params)
+        params["lang"] = "pl"
+        return str(url.copy_with(query=None)), params
+
+    async def get_hold_options(self, item: HoldableItem) -> HoldRequestOptions:
+        """Fetch the hold request form for one item: request type, material type and the
+        pickup locations Primo offers (read-only, verified live)."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        url, params = self._item_request_url(item)
+        # Same extra params the Primo UI sends when opening the form.
+        params.update(
+            {
+                "itemcategoryname": item.category or "",
+                "itemid": item.item_id,
+                "itemstatusname": item.status_name or "",
+                "mainlocationname": item.main_location or "",
+                "secondarylocationname": item.sub_location or "",
+                "vid": self.view or "",
+            }
+        )
+        response = await self.client.get(url, params=params, headers={"Authorization": f"Bearer {self.token}"})
+        response.raise_for_status()
+        services = response.json().get("services-arr", {}).get("services", [])
+
+        for service in services:
+            for group in service.get("groups-list-map", []) or []:
+                request_type = group.get("requestType") or "hold"
+                if request_type != "hold":
+                    continue
+                pickups = [
+                    PickupLocation.from_key(p["key"], p.get("value", ""))
+                    for p in group.get("pickupLocation", []) or []
+                    if p.get("key")
+                ]
+                material_type = (group.get("materialType") or {}).get("key")
+                if not material_type:
+                    raise ValueError("Hold request form has no material type")
+                return HoldRequestOptions(
+                    item=item, request_type=request_type, material_type=material_type, pickup_locations=pickups
+                )
+        raise ValueError(f"Item {item.item_id} offers no hold request option")
+
+    async def place_hold(self, options: HoldRequestOptions, pickup: PickupLocation) -> Dict[str, Any]:
+        """Place a hold on `options.item`, to be picked up at `pickup` (one of
+        `options.pickup_locations`).
+
+        Request shape captured from the Primo UI's own submit (`curls/zamowienie`). A
+        successful response (verified live) is only the envelope
+        `{"beaconO22": ..., "reply-text": "ok", "status": "ok"}` — no request ID — and the
+        new hold appears in `get_requests()` with a delay of a few seconds, so callers
+        needing the request ID must poll for it. Failure envelopes raise `ValueError`."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        url, params = self._item_request_url(options.item)
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json;charset=UTF-8"}
+        data = {
+            "requestType": options.request_type,
+            "pickupLocation": pickup.id,
+            "materialType": options.material_type,
+            "itemId": options.item.item_id,
+            "group_id": options.item.mmsid,
+            "pickupLibraryId": pickup.id,
+            "pickupType": pickup.type,
+        }
+        response = await self.client.post(url, params=params, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        _raise_for_primo_failure(result)
+        return result
+
+    async def get_item_queue(self, item_id: str) -> Optional[str]:
+        """Human-readable hold queue for one item, e.g. `"(zamówienie: 1)"`."""
+        if not self.token:
+            raise ValueError("Not logged in")
+
+        response = await self.client.get(
+            f"{self.base_url}/primaws/rest/priv/ILSServices/itemQueue/{item_id}",
+            params={"record-institution": self.institution or "", "lang": "pl"},
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        response.raise_for_status()
+        return response.json().get("itemQueueString")
 
     async def close(self):
         if self._close_client:

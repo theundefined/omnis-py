@@ -6,6 +6,7 @@ from omnis.cli import (
     _apply_demo_mode,
     _enabled_accounts,
     _exit_demo_mode,
+    _select_account,
     _set_account_enabled,
     _set_account_timeout,
 )
@@ -110,3 +111,39 @@ def test_old_config_without_new_keys_treated_as_enabled_default_timeout():
     account = _account()
     assert account.get("enabled", True) is True
     assert account.get("timeout", 30.0) == 30.0
+
+
+def test_select_account_refuses_to_guess_between_several_enabled():
+    accounts = [{"username": "a"}, {"username": "b"}]
+    account, error = _select_account(accounts, None)
+    assert account is None
+    assert "--account" in error
+
+
+def test_select_account_uses_the_only_enabled_one():
+    accounts = [{"username": "a", "enabled": False}, {"username": "b"}]
+    assert _select_account(accounts, None) == ({"username": "b"}, None)
+
+
+def test_select_account_by_one_based_index():
+    accounts = [{"username": "a"}, {"username": "b"}]
+    assert _select_account(accounts, 2) == ({"username": "b"}, None)
+
+
+@pytest.mark.parametrize("index", [0, 3, -1])
+def test_select_account_rejects_out_of_range_index(index):
+    account, error = _select_account([{"username": "a"}, {"username": "b"}], index)
+    assert account is None
+    assert "No account at index" in error
+
+
+def test_select_account_rejects_disabled_index():
+    account, error = _select_account([{"username": "a", "enabled": False}], 1)
+    assert account is None
+    assert "disabled" in error
+
+
+def test_select_account_no_enabled_accounts():
+    account, error = _select_account([{"username": "a", "enabled": False}], None)
+    assert account is None
+    assert "No enabled accounts" in error
